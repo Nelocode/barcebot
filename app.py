@@ -930,7 +930,7 @@ def api_data():
             audios[lang][audio_file] = audio_path.exists()
     
     # Verificar si hay QR disponible
-    qr_available = (BASE_DIR / "wa_qr.png").exists() if wa_running is None else False
+    qr_available = (BASE_DIR / "wa_qr.png").exists()
     
     return jsonify({
         "ok": True,
