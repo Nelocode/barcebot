@@ -1,0 +1,17 @@
+{
+  "name": "replaybot",
+  "version": "1.0.0",
+  "description": "Bot AutoReply Comercial — Telegram + WhatsApp",
+  "type": "module",
+  "scripts": {
+    "start:wa": "node wa_bot.mjs",
+    "start:panel": "python app.py",
+    "start:bot": "python bot.py",
+    "setup": "pip install flask gunicorn && npm install",
+    "deploy": "pip install flask gunicorn && npm install --production"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
+    "qrcode": "^1.5.4"
+  }
+}

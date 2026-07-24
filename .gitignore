@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+
+# Sensitive config
+.env.local
+.env
+
+# Auth sessions
+wa_auth/
+
+# Logs
+*.log
+
+# Generated files
+wa_qr.png
+panel_screenshot*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
