@@ -1604,6 +1604,13 @@ def api_start_botfather():
 
     try:
         import time, subprocess, sys
+        
+        # Asegurar que python-telegram-bot esté instalado
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "python-telegram-bot>=21.0", "-q"],
+            capture_output=True, timeout=30
+        )
+        
         bot_script = str(BASE_DIR / "botfather_bot.py")
         log_file = str(BASE_DIR / "botfather_bot.log")
         with open(log_file, "a") as f:
