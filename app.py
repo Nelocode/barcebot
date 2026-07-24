@@ -9,8 +9,9 @@ from pathlib import Path
 from flask import Flask, render_template_string, request, jsonify, send_from_directory
 
 BASE_DIR = Path(__file__).parent
-AUDIO_DIR = BASE_DIR / "audios"
-MESSAGES_FILE = BASE_DIR / "messages.json"
+DATA_DIR = BASE_DIR / "data"
+AUDIO_DIR = DATA_DIR / "audios"
+MESSAGES_FILE = DATA_DIR / "messages.json"
 
 app = Flask(__name__)
 APP_SECRET = os.environ.get("FLASK_SECRET", "bot-autoreply-secret-change-me")
@@ -660,7 +661,7 @@ def get_bot_token():
     if token:
         return token
     # Fallback: leer desde .env.local en el directorio del bot
-    env_file = BASE_DIR / ".env.local"
+    env_file = DATA_DIR / ".env.local"
     if env_file.exists():
         with open(env_file, "r") as f:
             for line in f:
@@ -944,7 +945,7 @@ def api_link_telegram():
         return jsonify({"ok": False, "error": f"No se pudo validar: {str(e)}"}), 500
     
     # Guardar en .env.local
-    env_file = BASE_DIR / ".env.local"
+    env_file = DATA_DIR / ".env.local"
     try:
         lines = []
         if env_file.exists():

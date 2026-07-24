@@ -6,6 +6,16 @@ echo "╔═══════════════════════�
 echo "║   Bot AutoReply — Iniciando servicios       ║"
 echo "╚══════════════════════════════════════════════╝"
 
+# ── 0. Preparar directorio de datos persistente ──────────────────────
+mkdir -p /app/data/audios /app/data/wa_auth
+# Copiar defaults si no existen en data/
+[ -f /app/data/messages.json ] || cp /app/messages.json /app/data/messages.json
+[ -f /app/data/.env.local ] || touch /app/data/.env.local
+# Copiar audios por defecto si data/audios está vacío
+if [ -z "$(ls -A /app/data/audios 2>/dev/null)" ]; then
+    cp -r /app/audios/* /app/data/audios/ 2>/dev/null || true
+fi
+
 # ── 1. Bot Telegram ──────────────────────────────────────────────────
 if [ -n "$AUTOREPLY_BOT_TOKEN" ] && [ "$AUTOREPLY_BOT_TOKEN" != "TU_TOKEN_AQUI" ]; then
     echo "📱 Iniciando Bot Telegram..."

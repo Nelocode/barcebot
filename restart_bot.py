@@ -46,7 +46,7 @@ def main():
     token = os.environ.get("AUTOREPLY_BOT_TOKEN")
     if not token:
         # Intentar leer de .env.local
-        env_file = BASE_DIR / ".env.local"
+        env_file = BASE_DIR / "data" / ".env.local"
         if env_file.exists():
             with open(env_file) as f:
                 for line in f:

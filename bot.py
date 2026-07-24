@@ -20,11 +20,11 @@ BOT_TOKEN = os.environ.get("AUTOREPLY_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Set AUTOREPLY_BOT_TOKEN env var")
 
-AUDIO_DIR = Path(__file__).parent / "audios"
+AUDIO_DIR = Path(__file__).parent / "data" / "audios"
 RESET_TIMEOUT = 3600  # 1 hora en segundos
 
 # ── Mensajes (desde JSON externo) ─────────────────────────────────────
-MESSAGES_FILE = Path(__file__).parent / "messages.json"
+MESSAGES_FILE = Path(__file__).parent / "data" / "messages.json"
 
 def load_messages() -> dict:
     """Carga mensajes desde messages.json. Cada idioma tiene steps con text y audio, y opcionalmente 'call'."""

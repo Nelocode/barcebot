@@ -12,9 +12,9 @@ import QRCode from 'qrcode';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = path.resolve(process.env.BOT_DIR || __dirname);
-const AUDIO_DIR = path.join(BASE_DIR, 'audios');
-const MESSAGES_FILE = path.join(BASE_DIR, 'messages.json');
-const AUTH_DIR = path.join(BASE_DIR, 'wa_auth');
+const AUDIO_DIR = path.join(BASE_DIR, 'data', 'audios');
+const MESSAGES_FILE = path.join(BASE_DIR, 'data', 'messages.json');
+const AUTH_DIR = path.join(BASE_DIR, 'data', 'wa_auth');
 const RESET_TIMEOUT = 3600 * 1000; // 1 hora en ms
 
 // ── Cargar mensajes ──
