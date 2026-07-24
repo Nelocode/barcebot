@@ -789,8 +789,11 @@ async function linkBotFather() {
 }
 
 async function launchWaAndShowQr() {
-  document.getElementById("wa-link-status").innerHTML = '🔄 Lanzando WhatsApp bot...';
+  document.getElementById("wa-link-status").innerHTML = '🔄 Limpiando sesión anterior y lanzando WhatsApp bot...';
   try {
+    // Primero limpiar sesión vieja
+    await fetch("/api/reset_wa", { method: "POST" });
+    // Luego lanzar
     const r = await fetch("/api/restart_wa_bot", { method: "POST" });
     const d = await r.json();
     if (d.ok) {
@@ -1566,6 +1569,21 @@ def api_restart_wa_bot():
         return jsonify({"ok": True, "message": "WA Bot reiniciado", "pid": pid})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/reset_wa", methods=["POST"])
+def api_reset_wa():
+    """Borra la sesión de WhatsApp para forzar un QR nuevo."""
+    import shutil
+    wa_auth_dir = DATA_DIR / "wa_auth"
+    if wa_auth_dir.exists():
+        shutil.rmtree(str(wa_auth_dir), ignore_errors=True)
+    wa_auth_dir.mkdir(parents=True, exist_ok=True)
+    # También borrar QR viejo
+    qr_path = BASE_DIR / "wa_qr.png"
+    if qr_path.exists():
+        qr_path.unlink()
+    return jsonify({"ok": True, "message": "Sesión WA eliminada"})
 
 
 @app.route("/api/start_botfather", methods=["POST"])
