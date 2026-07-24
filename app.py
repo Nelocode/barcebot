@@ -1496,13 +1496,6 @@ def restart_wa_bot():
         except (OSError, ValueError):
             pass
     
-    # Limpiar sesión WA corrupta para forzar QR nuevo
-    wa_auth_dir = DATA_DIR / "wa_auth"
-    if wa_auth_dir.exists():
-        import shutil
-        shutil.rmtree(str(wa_auth_dir), ignore_errors=True)
-        wa_auth_dir.mkdir(parents=True, exist_ok=True)
-    
     # Lanzar nuevo proceso wa_bot.mjs
     node = "node"
     wa_script = str(BASE_DIR / "wa_bot.mjs")
