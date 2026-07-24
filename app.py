@@ -57,6 +57,9 @@ hr { border-color: #2a2a4a; }
 summary { color: #5a9af0; cursor: pointer; }
 code { background: #12122a; color: #e8a0d0; padding: 2px 6px; border-radius: 4px; }
 .badge.bg-secondary { background: #2a2a4a !important; color: #b0b0d0 !important; }
+label { color: #c8c8e0 !important; font-weight: 500; }
+.label-text { color: #c8c8e0; }
+.card-body .small, .card-body small { color: #9a9ab0 !important; }
 </style>
 </head>
 <body>
