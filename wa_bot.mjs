@@ -218,10 +218,23 @@ async function startBot() {
     for (const msg of messages) {
       // Ignorar mensajes propios, status, grupos
       if (msg.key.fromMe) continue;
-      if (msg.key.remoteJid?.endsWith('@g.us')) continue; // ignorar grupos
-      if (!msg.key.remoteJid?.endsWith('@s.whatsapp.net')) continue;
+      const remoteJid = msg.key.remoteJid || '';
+      const altJid = msg.key.remoteJidAlt || '';
+      if (remoteJid.endsWith('@g.us') || altJid.endsWith('@g.us')) continue; // ignorar grupos
+      
+      // Aceptar tanto @s.whatsapp.net como @lid (nuevo formato WhatsApp)
+      const isDirectMessage = remoteJid.endsWith('@s.whatsapp.net') 
+                           || remoteJid.endsWith('@lid')
+                           || altJid.endsWith('@s.whatsapp.net');
+      if (!isDirectMessage) {
+        console.log(`[WA]   skipped — not a DM: remoteJid=${remoteJid} altJid=${altJid}`);
+        continue;
+      }
 
-      const jid = msg.key.remoteJid;
+      // Usar el JID alternativo si el principal es @lid
+      const jid = remoteJid.endsWith('@s.whatsapp.net') ? remoteJid : altJid;
+      if (!jid) continue;
+      
       const text = (msg.message?.conversation || msg.message?.extendedTextMessage?.text || '').trim();
 
       if (!text) {
