@@ -1395,6 +1395,7 @@ def api_bf_status():
 @app.route("/api/link_botfather", methods=["POST"])
 def api_link_botfather():
     """Valida y guarda el token de BotFather."""
+    import subprocess
     data = request.get_json()
     token = (data.get("token") or "").strip()
 
