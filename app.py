@@ -900,9 +900,9 @@ def bot_is_running():
             return "bot.py" in result.stdout.lower() and "restart_bot.py" not in result.stdout.lower()
         else:
             result = subprocess.run(
-                ["pgrep", "-f", "bot.py"], capture_output=True, timeout=5
+                ["ps", "aux"], capture_output=True, text=True, timeout=5
             )
-            return result.returncode == 0
+            return "bot.py" in result.stdout and "restart_bot.py" not in result.stdout
     except:
         return None  # Incierto
 
@@ -1451,10 +1451,11 @@ def bf_is_running():
             )
             return "botfather_bot.py" in result.stdout.lower()
         else:
+            # Usar ps aux que está disponible en cualquier Linux
             result = subprocess.run(
-                ["pgrep", "-f", "botfather_bot.py"], capture_output=True, timeout=5
+                ["ps", "aux"], capture_output=True, text=True, timeout=5
             )
-            return result.returncode == 0
+            return "botfather_bot.py" in result.stdout
     except:
         return False
 
@@ -1477,9 +1478,9 @@ def wa_is_running():
             return None  # No vinculado aún
         else:
             result = subprocess.run(
-                ["pgrep", "-f", "wa_bot.mjs"], capture_output=True, timeout=5
+                ["ps", "aux"], capture_output=True, text=True, timeout=5
             )
-            return result.returncode == 0
+            return "wa_bot.mjs" in result.stdout
     except:
         return None  # Incierto
 
