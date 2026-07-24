@@ -24,7 +24,7 @@ function loadMessages() {
   const result = {};
   for (const [lang, langData] of Object.entries(data)) {
     result[lang] = {
-      steps: langData.steps.map(s => ({ text: s.text, audio: s.audio })),
+      steps: langData.steps.map(s => ({ text: s.text, audio: s.audio, loop: s.loop || false })),
       call: langData.call || { text: '📞 Llamada recibida', audio: '' }
     };
   }
@@ -214,6 +214,8 @@ async function startBot() {
     for (const m of messages) {
       console.log(`[WA]   msg key=${JSON.stringify(m.key)} fromMe=${m.key.fromMe} hasMsg=${!!m.message} type=${type}`);
     }
+    // Solo procesar notify (mensajes reales), ignorar sync/echo
+    if (type !== 'notify') return;
 
     for (const msg of messages) {
       // Ignorar mensajes propios, status, grupos
@@ -256,13 +258,18 @@ async function startBot() {
         userState.set(jid, state);
         stepToUse = 0;
       } else {
-        stepToUse = Math.min(state.step + 1, 2);
-        state.step = stepToUse;
+        const maxStep = MESSAGES[state.lang]?.steps?.length - 1 || 2;
+        stepToUse = Math.min(state.step + 1, maxStep);
         state.lastSeen = now;
       }
 
       const lang = state.lang;
       const msgData = getMessage(lang, stepToUse);
+
+      // Solo avanzar step si NO es loop
+      if (!msgData.loop) {
+        state.step = stepToUse;
+      }
 
       // ── Enviar texto ──
       await sock.sendMessage(jid, { text: msgData.text });

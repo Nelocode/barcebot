@@ -295,7 +295,13 @@ function renderSteps(data) {
     html += `
     <div class="mb-4 p-3" style="background:#141428; border-radius:8px;" data-step="${i}">
       <div class="d-flex justify-content-between align-items-center mb-2">
-        <span class="step-label">Paso ${i+1}</span>
+        <div class="d-flex align-items-center gap-2">
+          <span class="step-label">Paso ${i+1}</span>
+          <label class="small mb-0" style="cursor:pointer;color:#aaa;">
+            <input type="checkbox" ${step.loop ? 'checked' : ''} onchange="saveStepLoop('${lang}', ${i}, this.checked)" style="accent-color:#6ea8fe;">
+            🔁 Loop
+          </label>
+        </div>
         <button class="btn btn-sm btn-danger" onclick="removeStep('${lang}', ${i})">✕</button>
       </div>
       <div class="row g-3">
@@ -365,6 +371,14 @@ function switchLang(lang) {
     b.classList.toggle("btn-light", b.dataset.lang === lang);
   });
   loadData();
+}
+
+async function saveStepLoop(lang, step, loop) {
+  await fetch("/api/messages", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({lang, step, loop, action: "edit_loop"})
+  });
 }
 
 async function saveStepText(lang, step, text) {
@@ -519,8 +533,9 @@ async function restartBot() {
 }
 
 async function restartWaBot() {
-  if (!confirm("¿Reiniciar el bot de WhatsApp? (toma efecto inmediato)")) return;
-  toast("🔄 Reiniciando bot WA...", "success");
+  if (!confirm("¿Reiniciar WhatsApp desde cero? Se borrará la sesión actual y necesitarás escanear un QR nuevo.")) return;
+  toast("🔄 Reseteando sesión WA...", "success");
+  await fetch("/api/reset_wa", { method: "POST" });
   fetch("/api/restart_wa_bot", { method: "POST" }).catch(() => {});
   let attempts = 0;
   const check = setInterval(async () => {
@@ -532,6 +547,8 @@ async function restartWaBot() {
         clearInterval(check);
         toast("✅ Bot WA reiniciado y online", "success");
         updateWaStatus(true);
+        // Mostrar QR si está disponible
+        setTimeout(loadWaQr, 3000);
       } else if (attempts >= 6) {
         clearInterval(check);
         toast("⚠️ Restart WA lanzado, verifica el QR si es primera vez", "error");
@@ -1015,6 +1032,15 @@ def api_messages():
         if "call" not in lang_data:
             lang_data["call"] = {"text": "", "audio": ""}
         lang_data["call"]["text"] = text
+        save_messages_json(messages)
+        return jsonify({"ok": True})
+
+    elif action == "edit_loop":
+        step = data.get("step")
+        loop = data.get("loop", False)
+        if step is None or step < 0 or step >= len(steps):
+            return jsonify({"ok": False, "error": "Invalid step"}), 400
+        steps[step]["loop"] = bool(loop)
         save_messages_json(messages)
         return jsonify({"ok": True})
 

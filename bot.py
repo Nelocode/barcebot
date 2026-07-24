@@ -69,7 +69,7 @@ def load_messages() -> dict:
     for lang, lang_data in data.items():
         steps = lang_data.get("steps", [])
         result[lang] = {
-            "steps": [(s["text"], s["audio"]) for s in steps],
+            "steps": [(s["text"], s["audio"], s.get("loop", False)) for s in steps],
             "call": lang_data.get("call", {"text": "📞 Llamada recibida", "audio": ""})
         }
     return result
@@ -177,13 +177,17 @@ async def handle_message(event):
         user_state[chat_id] = state
         step_to_use = 0
     else:
-        step_to_use = min(state["step"] + 1, 2)
-        state["step"] = step_to_use
+        step_to_use = min(state["step"] + 1, len(MESSAGES.get(state["lang"], MESSAGES["en"])["steps"]) - 1)
         state["last_seen"] = now
 
     lang = state["lang"]
     lang_data = MESSAGES.get(lang, MESSAGES["en"])
-    msg_text, audio_file = lang_data["steps"][step_to_use]
+    msg_text, audio_file, is_loop = lang_data["steps"][step_to_use]
+
+    # Solo avanzar step si NO es loop
+    if not is_loop:
+        state["step"] = step_to_use
+    # Si es loop, state["step"] se queda donde estaba
 
     # Enviar texto
     await client.send_message(chat_id, msg_text)
