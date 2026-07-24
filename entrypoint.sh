@@ -16,7 +16,7 @@ if [ -z "$(ls -A /app/data/audios 2>/dev/null)" ]; then
     cp -r /app/audios/* /app/data/audios/ 2>/dev/null || true
 fi
 
-# ── 1. Bot Telegram ──────────────────────────────────────────────────
+# ── 1. Bot Telegram (User Bot - Telethon) ────────────────────────────
 # Cargar credenciales desde .env.local si no están en environment
 if [ -f /app/data/.env.local ]; then
     export $(grep -v '^#' /app/data/.env.local | grep -E '^TG_(API_ID|API_HASH|PHONE)=' | xargs)
@@ -28,6 +28,20 @@ if [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ]; then
     echo "  → PID: $!"
 else
     echo "⚠️  Credenciales de user bot no configuradas. Configura api_id, api_hash y phone desde el panel."
+fi
+
+# ── 1b. Bot Telegram (BotFather - Bot API) ───────────────────────────
+# Cargar token desde .env.local si no está en environment
+if [ -f /app/data/.env.local ]; then
+    export $(grep -v '^#' /app/data/.env.local | grep -E '^AUTOREPLY_BOT_TOKEN=' | xargs)
+fi
+
+if [ -n "$AUTOREPLY_BOT_TOKEN" ]; then
+    echo "🤖 Iniciando BotFather Bot..."
+    nohup python botfather_bot.py > /tmp/bot_bf.log 2>&1 &
+    echo "  → PID: $!"
+else
+    echo "⚠️  AUTOREPLY_BOT_TOKEN no configurado. El BotFather bot no arrancará."
 fi
 
 # ── 2. Bot WhatsApp ──────────────────────────────────────────────────

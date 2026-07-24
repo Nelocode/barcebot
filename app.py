@@ -79,7 +79,8 @@ label { color: #c8c8e0 !important; font-weight: 500; }
     </div>
     <div class="d-flex align-items-center gap-3">
       <div class="d-flex flex-column align-items-end" style="gap: 4px;">
-        <span id="bot-status" class="badge bg-secondary" style="font-size:0.75rem;">📱 TG: Verificando...</span>
+        <span id="bot-status" class="badge bg-secondary" style="font-size:0.75rem;">📱 TG User: Verificando...</span>
+        <span id="bf-status" class="badge bg-secondary" style="font-size:0.75rem;">🤖 BotFather: Verificando...</span>
         <span id="wa-status" class="badge bg-secondary" style="font-size:0.75rem;">💬 WA: Verificando...</span>
       </div>
       <button class="btn btn-sm btn-outline-light" onclick="showSetup()">⚙️ Configurar</button>
@@ -144,6 +145,24 @@ label { color: #c8c8e0 !important; font-weight: 500; }
           <div id="tg-password-status" class="small text-muted mt-1"></div>
         </div>
       </div>
+
+      <!-- ── BotFather (Bot API tradicional) ── -->
+      <hr class="my-3">
+      <h6 class="mb-2">🤖 BotFather (modo prueba/revisión)</h6>
+      <details class="mb-2">
+        <summary class="text-muted small" style="cursor:pointer;">📖 ¿Cómo crear un bot en BotFather?</summary>
+        <ol class="small mt-2" style="padding-left:1.5rem;">
+          <li>Abre Telegram y busca <strong>@BotFather</strong></li>
+          <li>Envía <code>/newbot</code> y sigue las instrucciones</li>
+          <li>BotFather te dará un <strong>token</strong> (ej: <code>123456789:ABCdefGHIjkl...</code>)</li>
+          <li>Pega ese token abajo</li>
+        </ol>
+      </details>
+      <div class="d-flex align-items-center gap-2 mb-2">
+        <input id="bf-token-input" type="text" class="form-control form-control-sm" placeholder="Token de BotFather" style="flex:1;font-family:monospace;font-size:0.8rem;">
+        <button class="btn btn-sm btn-outline-light" onclick="linkBotFather()">🔗 Vincular</button>
+      </div>
+      <div id="bf-link-status" class="small text-muted mb-2"></div>
 
       <!-- ── WhatsApp ── -->
       <h6 class="mb-2">💬 WhatsApp</h6>
@@ -249,6 +268,7 @@ async function loadData() {
     const data = await r.json();
     renderSteps(data);
     updateBotStatus(data.bot_running);
+    updateBfStatus(data.bf_running);
     updateWaStatus(data.wa_running);
   } catch(e) {
     toast("Error cargando datos: " + e.message, "error");
@@ -524,13 +544,27 @@ async function updateBotStatus(running) {
   const el = document.getElementById("bot-status");
   if (running === true) {
     el.className = "badge bg-success";
-    el.innerHTML = '📱 TG: <span class="status-dot status-online"></span> Online';
+    el.innerHTML = '📱 TG User: <span class="status-dot status-online"></span> Online';
   } else if (running === false) {
     el.className = "badge bg-danger";
-    el.innerHTML = '📱 TG: <span class="status-dot status-offline"></span> Offline';
+    el.innerHTML = '📱 TG User: <span class="status-dot status-offline"></span> Offline';
   } else {
     el.className = "badge bg-secondary";
-    el.innerHTML = '📱 TG: Incierto';
+    el.innerHTML = '📱 TG User: Incierto';
+  }
+}
+
+async function updateBfStatus(running) {
+  const el = document.getElementById("bf-status");
+  if (running === true) {
+    el.className = "badge bg-success";
+    el.innerHTML = '🤖 BotFather: <span class="status-dot status-online"></span> Online';
+  } else if (running === false) {
+    el.className = "badge bg-secondary";
+    el.innerHTML = '🤖 BotFather: No configurado';
+  } else {
+    el.className = "badge bg-secondary";
+    el.innerHTML = '🤖 BotFather: Verificando...';
   }
 }
 
@@ -599,6 +633,16 @@ function showSetup() {
       document.getElementById("tg-phone").placeholder = d.phone || 'Ya configurado';
     } else {
       el.innerHTML = '⚠️ Sin vincular. Ingresa api_id, api_hash y número de teléfono.';
+    }
+  }).catch(() => {});
+  // BotFather status
+  fetch("/api/bf_status").then(r => r.json()).then(d => {
+    const el = document.getElementById("bf-link-status");
+    if (d.linked) {
+      el.innerHTML = '✅ <strong>Vinculado</strong> como @' + (d.bot_name || 'desconocido');
+      document.getElementById("bf-token-input").placeholder = 'Token configurado';
+    } else {
+      el.innerHTML = '⚠️ Sin token. Crea un bot en @BotFather y pega el token.';
     }
   }).catch(() => {});
 }
@@ -714,6 +758,34 @@ async function cancelTgAuth() {
   document.getElementById("tg-code-section").style.display = 'none';
   document.getElementById("tg-2fa-section").style.display = 'none';
   document.getElementById("tg-link-status").innerHTML = '⚠️ Vinculación cancelada. Intenta de nuevo.';
+}
+
+async function linkBotFather() {
+  const token = document.getElementById("bf-token-input").value.trim();
+  if (!token) { toast("❌ Pega el token primero", "error"); return; }
+  if (!token.includes(":")) { toast("❌ Token inválido", "error"); return; }
+
+  const el = document.getElementById("bf-link-status");
+  el.innerHTML = '🔄 Validando token...';
+
+  try {
+    const r = await fetch("/api/link_botfather", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({token})
+    });
+    const d = await r.json();
+    if (d.ok) {
+      toast("✅ BotFather vinculado como @" + d.bot_name, "success");
+      el.innerHTML = '✅ <strong>Vinculado</strong> como @' + d.bot_name;
+    } else {
+      toast("❌ " + (d.error || "Error"), "error");
+      el.innerHTML = '❌ ' + (d.error || "Error");
+    }
+  } catch(e) {
+    toast("❌ Error: " + e.message, "error");
+    el.innerHTML = '❌ Error de conexión';
+  }
 }
 
 async function launchWaAndShowQr() {
@@ -868,6 +940,7 @@ def api_data():
         "ok": True,
         "messages": messages,
         "bot_running": running,
+        "bf_running": bf_is_running(),
         "wa_running": wa_running,
         "wa_qr": qr_available,
         "audios": audios
@@ -1292,8 +1365,97 @@ def api_status():
     """Estado de los bots (para polling del frontend)."""
     return jsonify({
         "bot_running": is_bot_running(),
+        "bf_running": bf_is_running(),
         "wa_running": wa_is_running()
     })
+
+
+@app.route("/api/bf_status")
+def api_bf_status():
+    """Estado del BotFather bot."""
+    token = os.environ.get("AUTOREPLY_BOT_TOKEN") or _read_env_var("AUTOREPLY_BOT_TOKEN")
+    linked = token is not None
+    result = {"linked": linked}
+    if linked:
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["curl", "-s", "--connect-timeout", "5",
+                 f"https://api.telegram.org/bot{token}/getMe"],
+                capture_output=True, text=True, timeout=10
+            )
+            data = json.loads(r.stdout)
+            if data.get("ok"):
+                result["bot_name"] = data["result"].get("username", "")
+        except:
+            pass
+    return jsonify(result)
+
+
+@app.route("/api/link_botfather", methods=["POST"])
+def api_link_botfather():
+    """Valida y guarda el token de BotFather."""
+    data = request.get_json()
+    token = (data.get("token") or "").strip()
+
+    if not token or ":" not in token:
+        return jsonify({"ok": False, "error": "Token inválido"}), 400
+
+    # Validar con Telegram
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "--connect-timeout", "5",
+             f"https://api.telegram.org/bot{token}/getMe"],
+            capture_output=True, text=True, timeout=10
+        )
+        resp = json.loads(r.stdout)
+        if not resp.get("ok"):
+            return jsonify({"ok": False, "error": "Token inválido o revocado"}), 400
+        bot_name = resp["result"].get("username", "desconocido")
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Error validando: {str(e)}"}), 500
+
+    # Guardar en .env.local
+    env_file = DATA_DIR / ".env.local"
+    lines = []
+    if env_file.exists():
+        with open(env_file, "r") as f:
+            lines = f.readlines()
+    new_lines = []
+    found = False
+    for line in lines:
+        if line.strip().startswith("AUTOREPLY_BOT_TOKEN="):
+            new_lines.append(f"AUTOREPLY_BOT_TOKEN={token}\n")
+            found = True
+        else:
+            new_lines.append(line)
+    if not found:
+        new_lines.append(f"AUTOREPLY_BOT_TOKEN={token}\n")
+    with open(env_file, "w") as f:
+        f.writelines(new_lines)
+
+    os.environ["AUTOREPLY_BOT_TOKEN"] = token
+    return jsonify({"ok": True, "bot_name": bot_name})
+
+
+def bf_is_running():
+    """Verifica si el BotFather bot está corriendo (proceso botfather_bot.py)."""
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ['powershell.exe', '-Command',
+                 "Get-CimInstance Win32_Process -Filter \"name = 'python.exe'\" | "
+                 "Select-Object CommandLine | Format-Table -HideTableHeaders -AutoSize"],
+                capture_output=True, text=True, timeout=5
+            )
+            return "botfather_bot.py" in result.stdout.lower()
+        else:
+            result = subprocess.run(
+                ["pgrep", "-f", "botfather_bot.py"], capture_output=True, timeout=5
+            )
+            return result.returncode == 0
+    except:
+        return False
 
 def wa_is_running():
     """Verifica si el bot de WhatsApp (node wa_bot.mjs) está corriendo."""
