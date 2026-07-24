@@ -4,7 +4,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # ── Instalar Node.js 20 ──
-RUN apt-get update && apt-get install -y curl gnupg && \
+RUN apt-get update && apt-get install -y curl gnupg procps && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
