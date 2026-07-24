@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y curl gnupg procps && \
     rm -rf /var/lib/apt/lists/*
 
 # ── Copiar dependencias primero (caché de Docker) ──
+# Build: 2026-07-24 — force rebuild for python-telegram-bot
 COPY requirements.txt package.json ./
 
 # ── Instalar dependencias ──
