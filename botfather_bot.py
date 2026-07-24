@@ -21,6 +21,25 @@ MESSAGES_FILE = DATA_DIR / "messages.json"
 RESET_TIMEOUT = 3600
 
 BOT_TOKEN = os.environ.get("AUTOREPLY_BOT_TOKEN")
+
+# ── Intentar cargar de .env.local si no está en environment ────────
+def _load_env_file():
+    env_file = DATA_DIR / ".env.local"
+    if not env_file.exists():
+        return
+    with open(env_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip().strip('"').strip("'")
+            if key == "AUTOREPLY_BOT_TOKEN" and val:
+                os.environ[key] = val
+
+_load_env_file()
+BOT_TOKEN = os.environ.get("AUTOREPLY_BOT_TOKEN")  # Re-leer
+
 if not BOT_TOKEN:
     logging.warning("AUTOREPLY_BOT_TOKEN not set. BotFather bot will not start.")
     # Don't crash — just log and exit gracefully
