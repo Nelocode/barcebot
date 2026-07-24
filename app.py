@@ -1450,56 +1450,40 @@ def bf_is_running():
         return False
 
 def wa_is_running():
-    """Verifica si el bot de WhatsApp (node wa_bot.mjs) está corriendo."""
+    """Verifica si el bot de WhatsApp está corriendo (por archivo PID)."""
+    pid_file = DATA_DIR / "wa_bot.pid"
     try:
-        if sys.platform == "win32":
-            result = subprocess.run(
-                ['powershell.exe', '-Command',
-                 "Get-CimInstance Win32_Process -Filter \"name = 'node.exe'\" | "
-                 "Select-Object CommandLine | Format-Table -HideTableHeaders -AutoSize"],
-                capture_output=True, text=True, timeout=5
-            )
-            lines = result.stdout.lower()
-            if "wa_bot.mjs" in lines:
-                return True
-            # Si hay carpeta wa_auth/ pero no hay proceso, está desconectado
+        if not pid_file.exists():
+            # Verificar si hay auth previa (carpeta wa_auth con datos)
             if (DATA_DIR / "wa_auth").exists() and any((DATA_DIR / "wa_auth").iterdir()):
                 return False  # Auth exists but process dead
             return None  # No vinculado aún
-        else:
-            result = subprocess.run(
-                ["ps", "aux"], capture_output=True, text=True, timeout=5
-            )
-            return "wa_bot.mjs" in result.stdout
-    except:
-        return None  # Incierto
+        with open(pid_file, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
 
 def restart_wa_bot():
     """Reinicia el bot de WhatsApp matando el proceso node y relanzándolo."""
     import subprocess, sys, time
     
-    # Matar procesos node existentes con wa_bot.mjs
-    try:
-        if sys.platform == "win32":
-            ps_result = subprocess.run(
-                ['powershell.exe', '-Command',
-                 "Get-CimInstance Win32_Process -Filter \"name = 'node.exe'\" | "
-                 "Select-Object ProcessId,CommandLine | ConvertTo-Csv -NoTypeInformation"],
-                capture_output=True, text=True, timeout=10
-            )
-            for line in ps_result.stdout.splitlines():
-                if "wa_bot.mjs" in line.lower() and '"' in line:
-                    parts = line.replace('"', '').split(',')
-                    if parts and parts[0].strip().isdigit():
-                        pid = parts[0].strip()
-                        subprocess.run(["taskkill", "/F", "/PID", pid], 
-                                      capture_output=True, timeout=5)
-                        time.sleep(1)
-        else:
-            subprocess.run(["pkill", "-f", "wa_bot.mjs"], capture_output=True, timeout=5)
+    # Matar proceso existente por PID file
+    old_pid_file = DATA_DIR / "wa_bot.pid"
+    if old_pid_file.exists():
+        try:
+            with open(old_pid_file, "r") as f:
+                old_pid = int(f.read().strip())
+            os.kill(old_pid, 15)  # SIGTERM
             time.sleep(1)
-    except:
-        pass
+            try:
+                os.kill(old_pid, 0)
+                os.kill(old_pid, 9)  # SIGKILL
+            except OSError:
+                pass
+        except (OSError, ValueError):
+            pass
     
     # Lanzar nuevo proceso wa_bot.mjs
     node = "node"
@@ -1507,23 +1491,16 @@ def restart_wa_bot():
     log_file = str(BASE_DIR / "wa_bot.log")
     
     with open(log_file, "a") as f:
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            proc = subprocess.Popen(
-                [node, wa_script],
-                stdout=f, stderr=subprocess.STDOUT,
-                cwd=BASE_DIR,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
-                startupinfo=startupinfo
-            )
-        else:
-            proc = subprocess.Popen(
-                [node, wa_script],
-                stdout=f, stderr=subprocess.STDOUT,
-                cwd=BASE_DIR,
-                start_new_session=True
-            )
+        f.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        proc = subprocess.Popen(
+            [node, wa_script],
+            stdout=f, stderr=subprocess.STDOUT,
+            cwd=BASE_DIR,
+            start_new_session=True
+        )
+        # Guardar PID
+        with open(old_pid_file, "w") as pf:
+            pf.write(str(proc.pid))
     return proc.pid if proc else None
 
 @app.route("/api/restart_bot", methods=["POST"])
