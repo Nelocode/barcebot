@@ -855,27 +855,30 @@ def api_link_telegram():
     except Exception as e:
         return jsonify({"ok": False, "error": f"No se pudo guardar token: {str(e)}"}), 500
     
-    # Reiniciar el bot de Telegram
-    try:
-        from api_restart_bot import restart_bot as do_restart
-    except:
-        pass
-    
-    # Forzar restart
+    # Reiniciar el bot de Telegram de forma multiplataforma
     import subprocess, sys, time
     restart_script = str(BASE_DIR / "restart_bot.py")
     python = sys.executable
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     env = os.environ.copy()
     env["AUTOREPLY_BOT_TOKEN"] = token
-    subprocess.Popen(
-        [python, restart_script],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        env=env,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
-        startupinfo=startupinfo
-    )
+    
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        subprocess.Popen(
+            [python, restart_script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+            startupinfo=startupinfo
+        )
+    else:
+        subprocess.Popen(
+            [python, restart_script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True
+        )
     
     return jsonify({"ok": True, "bot_name": bot_name, "message": f"Vinculado como @{bot_name}"})
 
@@ -944,18 +947,24 @@ def restart_wa_bot():
     wa_script = str(BASE_DIR / "wa_bot.mjs")
     log_file = str(BASE_DIR / "wa_bot.log")
     
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    
     with open(log_file, "a") as f:
-        proc = subprocess.Popen(
-            [node, wa_script],
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            cwd=BASE_DIR,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
-            startupinfo=startupinfo
-        )
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            proc = subprocess.Popen(
+                [node, wa_script],
+                stdout=f, stderr=subprocess.STDOUT,
+                cwd=BASE_DIR,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+                startupinfo=startupinfo
+            )
+        else:
+            proc = subprocess.Popen(
+                [node, wa_script],
+                stdout=f, stderr=subprocess.STDOUT,
+                cwd=BASE_DIR,
+                start_new_session=True
+            )
     return proc.pid if proc else None
 
 @app.route("/api/restart_bot", methods=["POST"])
@@ -964,29 +973,33 @@ def api_restart_bot():
     import subprocess, sys, os, time
 
     restart_script = str(BASE_DIR / "restart_bot.py")
-    python = str(BASE_DIR.parent.parent / "hermes-agent" / "venv" / "Scripts" / "python.exe")
-    if not Path(python).exists():
-        python = sys.executable
+    python = sys.executable
 
     try:
-        # Lanzar restart_bot.py como proceso independiente
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        
         env = os.environ.copy()
-        # Asegurar que el token esté en el environment del script
         token = get_bot_token()
         if token:
             env["AUTOREPLY_BOT_TOKEN"] = token
         
-        proc = subprocess.Popen(
-            [python, restart_script],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
-            startupinfo=startupinfo
-        )
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            proc = subprocess.Popen(
+                [python, restart_script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+                startupinfo=startupinfo
+            )
+        else:
+            proc = subprocess.Popen(
+                [python, restart_script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True
+            )
         
         # Esperar un poco y leer output
         time.sleep(2)
