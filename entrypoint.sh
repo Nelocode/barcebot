@@ -6,7 +6,10 @@ echo "╔═══════════════════════�
 echo "║   Bot AutoReply — Iniciando servicios       ║"
 echo "╚══════════════════════════════════════════════╝"
 
-# ── 0. Preparar directorio de datos persistente ──────────────────────
+# ── 0. Instalar dependencias faltantes si es necesario ───────────────
+pip install python-telegram-bot>=21.0 2>/dev/null || true
+
+# ── 0b. Preparar directorio de datos persistente ─────────────────────
 mkdir -p /app/data/audios /app/data/wa_auth
 # Copiar defaults si no existen en data/
 [ -f /app/data/messages.json ] || cp /app/messages.json /app/data/messages.json
