@@ -115,11 +115,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id in user_state:
         del user_state[chat_id]
-    await update.message.reply_text(
-        "👋 Bot AutoReply activado.\n"
-        "Escribe cualquier mensaje para empezar.\n"
-        "Idiomas: Español, English, Français"
-    )
+    # Silent start — no welcome message.
+    # Language detection happens on the user's first real message.
+    # Deep link: t.me/hmsg_bot?start=silent
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
