@@ -1060,7 +1060,8 @@ def _do_upload_assemble():
         return jsonify({"ok": False, "error": "JSON required"}), 400
 
     lang = data.get("lang")
-    step = data.get("step", type=int)
+    step_raw = data.get("step")
+    step = int(step_raw) if step_raw is not None else None
     upload_type = data.get("type", "step")
     total_chunks = data.get("total_chunks")
     original_name = data.get("original_name", "")
