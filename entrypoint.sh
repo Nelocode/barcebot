@@ -42,4 +42,4 @@ fi
 # ── 3. Panel Admin ───────────────────────────────────────────────────
 echo "🖥️  Iniciando Panel Admin..."
 cd /app
-exec gunicorn -w 2 -b 0.0.0.0:5000 --access-logfile - --error-logfile - --timeout 120 app:app
+exec gunicorn -w 1 -b 0.0.0.0:5000 --access-logfile - --error-logfile - --timeout 120 app:app
