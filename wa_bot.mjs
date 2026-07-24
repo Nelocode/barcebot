@@ -210,6 +210,10 @@ async function startBot() {
 
   // ── Manejar mensajes entrantes ──
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    console.log(`[WA] messages.upsert type=${type} count=${messages.length}`);
+    for (const m of messages) {
+      console.log(`[WA]   msg key=${JSON.stringify(m.key)} fromMe=${m.key.fromMe} hasMsg=${!!m.message}`);
+    }
     if (type !== 'notify') return;
 
     for (const msg of messages) {
