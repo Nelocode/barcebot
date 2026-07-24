@@ -890,23 +890,17 @@ def _save_telegram_creds(api_id, api_hash, phone):
 
 
 def bot_is_running():
-    """Verifica si el bot está corriendo usando PowerShell (funciona en Windows)."""
+    """Verifica si el bot de Telegram está corriendo (por archivo PID)."""
+    pid_file = DATA_DIR / "tg_userbot.pid"
     try:
-        if sys.platform == "win32":
-            result = subprocess.run(
-                ['powershell.exe', '-Command',
-                 "Get-CimInstance Win32_Process -Filter \"name = 'python.exe'\" | "
-                 "Select-Object CommandLine | Format-Table -HideTableHeaders -AutoSize"],
-                capture_output=True, text=True, timeout=5
-            )
-            return "bot.py" in result.stdout.lower() and "restart_bot.py" not in result.stdout.lower()
-        else:
-            result = subprocess.run(
-                ["ps", "aux"], capture_output=True, text=True, timeout=5
-            )
-            return "bot.py" in result.stdout and "restart_bot.py" not in result.stdout
-    except:
-        return None  # Incierto
+        if not pid_file.exists():
+            return False
+        with open(pid_file, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
 
 @app.route("/")
 def index():

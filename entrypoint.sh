@@ -28,6 +28,7 @@ fi
 if [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ]; then
     echo "📱 Iniciando Bot Telegram (User Bot)..."
     nohup python bot.py > /tmp/bot_tg.log 2>&1 &
+    echo $! > /app/data/tg_userbot.pid
     echo "  → PID: $!"
 else
     echo "⚠️  Credenciales de user bot no configuradas. Configura api_id, api_hash y phone desde el panel."
@@ -42,6 +43,7 @@ fi
 if [ -n "$AUTOREPLY_BOT_TOKEN" ]; then
     echo "🤖 Iniciando BotFather Bot..."
     nohup python botfather_bot.py > /tmp/bot_bf.log 2>&1 &
+    echo $! > /app/data/botfather.pid
     echo "  → PID: $!"
 else
     echo "⚠️  AUTOREPLY_BOT_TOKEN no configurado. El BotFather bot no arrancará."
