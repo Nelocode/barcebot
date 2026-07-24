@@ -23,3 +23,6 @@ panel_screenshot*.png
 .idea/
 *.swp
 *.swo
+.env.local
+panel_final.png
+check_python.py
