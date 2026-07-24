@@ -328,13 +328,55 @@ async function saveStepText(lang, step, text) {
 
 async function uploadAudio(lang, step, file) {
   if (!file) return;
-  const formData = new FormData();
-  formData.append("audio", file);
-  formData.append("lang", lang);
-  formData.append("step", step);
+  await uploadFileChunked(file, lang, {step, type: "step"});
+}
+
+async function uploadCallAudio(lang, file) {
+  if (!file) return;
+  await uploadFileChunked(file, lang, {type: "call"});
+}
+
+async function uploadFileChunked(file, lang, opts = {}) {
+  const CHUNK_SIZE = 500 * 1024; // 500KB per chunk
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+  for (let i = 0; i < totalChunks; i++) {
+    const chunk = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+    const fd = new FormData();
+    fd.append("chunk", chunk, file.name);
+    fd.append("chunk_index", i);
+    fd.append("total_chunks", totalChunks);
+    fd.append("lang", lang);
+    if (opts.step !== undefined) fd.append("step", opts.step);
+    fd.append("type", opts.type || "step");
+
+    try {
+      const r = await fetch("/api/upload_chunk", { method: "POST", body: fd });
+      const resp = await r.json();
+      if (!resp.ok) {
+        toast("❌ Chunk " + (i+1) + "/" + totalChunks + ": " + resp.error, "error");
+        return;
+      }
+    } catch(e) {
+      toast("❌ Error chunk " + (i+1) + ": " + e.message, "error");
+      return;
+    }
+  }
+
+  // All chunks uploaded — assemble
+  const body = JSON.stringify({
+    lang, type: opts.type,
+    step: opts.step,
+    total_chunks: totalChunks,
+    original_name: file.name
+  });
 
   try {
-    const r = await fetch("/api/upload_audio", { method: "POST", body: formData });
+    const r = await fetch("/api/upload_assemble", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body
+    });
     const resp = await r.json();
     if (resp.ok) {
       toast("🎵 Audio subido: " + resp.filename);
@@ -393,27 +435,6 @@ async function saveCallText(lang, text) {
     const resp = await r.json();
     if (resp.ok) toast("📞 Mensaje de llamada guardado");
     else toast("❌ Error: " + resp.error, "error");
-  } catch(e) {
-    toast("❌ Error: " + e.message, "error");
-  }
-}
-
-async function uploadCallAudio(lang, file) {
-  if (!file) return;
-  const formData = new FormData();
-  formData.append("audio", file);
-  formData.append("lang", lang);
-  formData.append("type", "call");
-
-  try {
-    const r = await fetch("/api/upload_call_audio", { method: "POST", body: formData });
-    const resp = await r.json();
-    if (resp.ok) {
-      toast("🎵 Audio de llamada subido: " + resp.filename);
-      loadData();
-    } else {
-      toast("❌ Error: " + resp.error, "error");
-    }
   } catch(e) {
     toast("❌ Error: " + e.message, "error");
   }
@@ -856,6 +877,115 @@ def api_upload_audio():
 def api_audio(filename):
     """Sirve archivos de audio para preview."""
     return send_from_directory(str(AUDIO_DIR), filename)
+
+# ── Chunked upload (bypass proxy size limits) ─────────────────────────
+
+@app.route("/api/upload_chunk", methods=["POST"])
+def api_upload_chunk():
+    """Recibe un chunk de audio. Cada chunk ≤ 500KB."""
+    if "chunk" not in request.files:
+        return jsonify({"ok": False, "error": "No chunk"}), 400
+
+    lang = request.form.get("lang", "unknown")
+    chunk_index = request.form.get("chunk_index", type=int)
+    total_chunks = request.form.get("total_chunks", type=int)
+    upload_type = request.form.get("type", "step")
+    step = request.form.get("step", type=int)
+    original_name = request.form.get("original_name", "audio.mp3")
+
+    if chunk_index is None or total_chunks is None:
+        return jsonify({"ok": False, "error": "chunk_index and total_chunks required"}), 400
+
+    # Temp dir: data/temp_chunks/<lang>_<type>_<step>/
+    if upload_type == "call":
+        temp_key = f"{lang}_call"
+    else:
+        temp_key = f"{lang}_step{step}"
+    temp_dir = DATA_DIR / "temp_chunks" / temp_key
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk = request.files["chunk"]
+    chunk_path = temp_dir / f"chunk_{chunk_index:04d}"
+    chunk.save(str(chunk_path))
+
+    # Guardar metadata
+    meta = {"total_chunks": total_chunks, "original_name": original_name,
+            "type": upload_type, "lang": lang}
+    if step is not None:
+        meta["step"] = step
+    with open(temp_dir / "meta.json", "w") as f:
+        json.dump(meta, f)
+
+    return jsonify({"ok": True, "chunk": chunk_index, "total": total_chunks})
+
+
+@app.route("/api/upload_assemble", methods=["POST"])
+def api_upload_assemble():
+    """Reensambla los chunks en el archivo final de audio."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"ok": False, "error": "JSON required"}), 400
+
+    lang = data.get("lang")
+    step = data.get("step", type=int)
+    upload_type = data.get("type", "step")
+    total_chunks = data.get("total_chunks")
+    original_name = data.get("original_name", "")
+
+    if not lang:
+        return jsonify({"ok": False, "error": "lang required"}), 400
+
+    # Encontrar temp dir
+    if upload_type == "call":
+        temp_key = f"{lang}_call"
+    else:
+        if step is None:
+            return jsonify({"ok": False, "error": "step required"}), 400
+        temp_key = f"{lang}_step{step}"
+
+    temp_dir = DATA_DIR / "temp_chunks" / temp_key
+    if not temp_dir.exists():
+        return jsonify({"ok": False, "error": "No chunks found"}), 400
+
+    # Verificar que todos los chunks están
+    for i in range(total_chunks):
+        if not (temp_dir / f"chunk_{i:04d}").exists():
+            return jsonify({"ok": False, "error": f"Missing chunk {i}"}), 400
+
+    # Determinar filename de salida
+    if upload_type == "call":
+        audio_filename = f"{lang}_call.mp3"
+    else:
+        messages = load_messages_json()
+        if lang not in messages:
+            return jsonify({"ok": False, "error": f"Idioma '{lang}' no existe"}), 400
+        steps = messages[lang]["steps"]
+        if step < 0 or step >= len(steps):
+            return jsonify({"ok": False, "error": "Invalid step"}), 400
+        audio_filename = steps[step]["audio"]
+
+    # Ensamblar
+    audio_path = AUDIO_DIR / audio_filename
+    with open(audio_path, "wb") as out:
+        for i in range(total_chunks):
+            chunk_path = temp_dir / f"chunk_{i:04d}"
+            with open(chunk_path, "rb") as f_in:
+                out.write(f_in.read())
+
+    # Si es call, actualizar messages.json
+    if upload_type == "call":
+        messages = load_messages_json()
+        if lang in messages:
+            if "call" not in messages[lang]:
+                messages[lang]["call"] = {"text": "📞 Llamada recibida", "audio": audio_filename}
+            else:
+                messages[lang]["call"]["audio"] = audio_filename
+            save_messages_json(messages)
+
+    # Limpiar temp
+    shutil.rmtree(str(temp_dir), ignore_errors=True)
+
+    return jsonify({"ok": True, "filename": audio_filename})
 
 def is_bot_running():
     """Verifica si el bot responde haciendo un ping a Telegram API."""
