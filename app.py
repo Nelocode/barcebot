@@ -944,11 +944,22 @@ def api_data():
 
 @app.route("/api/wa_qr")
 def api_wa_qr():
-    """Sirve el QR de WhatsApp como imagen PNG."""
+    """Sirve la imagen QR generada por el bot de WhatsApp."""
     qr_path = BASE_DIR / "wa_qr.png"
     if qr_path.exists():
         return send_from_directory(str(BASE_DIR), "wa_qr.png")
-    return jsonify({"ok": False, "error": "No QR available"}), 404
+    return "QR not yet generated", 404
+
+
+@app.route("/api/wa_log")
+def api_wa_log():
+    """Devuelve las últimas líneas del log de WhatsApp para debug."""
+    log_path = BASE_DIR / "wa_bot.log"
+    if not log_path.exists():
+        return jsonify({"ok": False, "error": "No log file"})
+    with open(log_path, "r") as f:
+        lines = f.readlines()
+    return jsonify({"ok": True, "lines": lines[-50:]})  # Últimas 50 líneas
 
 @app.route("/api/messages", methods=["POST"])
 def api_messages():
