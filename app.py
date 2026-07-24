@@ -1575,6 +1575,19 @@ def api_restart_wa_bot():
 def api_reset_wa():
     """Borra la sesión de WhatsApp para forzar un QR nuevo."""
     import shutil
+    
+    # Matar proceso WA existente
+    old_pid_file = DATA_DIR / "wa_bot.pid"
+    if old_pid_file.exists():
+        try:
+            with open(old_pid_file, "r") as f:
+                old_pid = int(f.read().strip())
+            os.kill(old_pid, 9)
+        except:
+            pass
+        old_pid_file.unlink(missing_ok=True)
+    
+    # Borrar sesión
     wa_auth_dir = DATA_DIR / "wa_auth"
     if wa_auth_dir.exists():
         shutil.rmtree(str(wa_auth_dir), ignore_errors=True)
