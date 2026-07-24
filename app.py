@@ -808,6 +808,8 @@ async function launchWaAndShowQr() {
 // Auto-refresh cada 10 segundos
 loadData();
 setInterval(loadData, 10000);
+// Auto-iniciar BotFather si hay token configurado
+fetch("/api/start_botfather", {method:"POST"}).catch(()=>{});
 </script>
 </body>
 </html>"""
@@ -1588,6 +1590,32 @@ def api_restart_wa_bot():
         return jsonify({"ok": True, "message": "WA Bot reiniciado", "pid": pid})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/start_botfather", methods=["POST"])
+def api_start_botfather():
+    """Arranca el proceso botfather_bot.py si no está corriendo."""
+    if bf_is_running():
+        return jsonify({"ok": True, "message": "BotFather ya está corriendo"})
+
+    token = os.environ.get("AUTOREPLY_BOT_TOKEN") or _read_env_var("AUTOREPLY_BOT_TOKEN")
+    if not token:
+        return jsonify({"ok": False, "error": "Token no configurado"}), 400
+
+    try:
+        bot_script = str(BASE_DIR / "botfather_bot.py")
+        log_file = str(BASE_DIR / "botfather_bot.log")
+        with open(log_file, "a") as f:
+            f.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            subprocess.Popen(
+                [sys.executable, bot_script],
+                stdout=f, stderr=subprocess.STDOUT,
+                start_new_session=True
+            )
+        return jsonify({"ok": True, "message": "BotFather iniciado"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # ── Main ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
