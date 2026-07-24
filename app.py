@@ -1603,7 +1603,7 @@ def api_start_botfather():
         return jsonify({"ok": False, "error": "Token no configurado"}), 400
 
     try:
-        import time
+        import time, subprocess
         bot_script = str(BASE_DIR / "botfather_bot.py")
         log_file = str(BASE_DIR / "botfather_bot.log")
         with open(log_file, "a") as f:
