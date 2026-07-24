@@ -1,36 +1,70 @@
 """
-Bot AutoReply Comercial — Telegram
+Bot AutoReply Comercial — Telegram (User Bot via Telethon)
 Flujo: mensaje inicial → msg1+audio → msg2+audio → loop msg3+audio
 Idioma se detecta UNA VEZ al inicio y se queda fijo.
 Timeout de 1 hora sin actividad resetea el estado.
-"""
 
+User bot = sin /start, como un usuario normal.
+Credenciales desde env vars o .env.local.
+"""
 import os
 import re
 import json
 import time
+import asyncio
 import logging
 from pathlib import Path
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telethon import TelegramClient, events
+from telethon.tl.types import MessageMediaDocument
+from telethon.errors import SessionPasswordNeededError
 
 # ── Config ────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("AUTOREPLY_BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Set AUTOREPLY_BOT_TOKEN env var")
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+AUDIO_DIR = DATA_DIR / "audios"
+MESSAGES_FILE = DATA_DIR / "messages.json"
+SESSION_FILE = str(DATA_DIR / "tg_session")  # Telethon session
 
-AUDIO_DIR = Path(__file__).parent / "data" / "audios"
-RESET_TIMEOUT = 3600  # 1 hora en segundos
+RESET_TIMEOUT = 3600  # 1 hora
 
-# ── Mensajes (desde JSON externo) ─────────────────────────────────────
-MESSAGES_FILE = Path(__file__).parent / "data" / "messages.json"
+# Credenciales: de env vars o .env.local
+API_ID = os.environ.get("TG_API_ID")
+API_HASH = os.environ.get("TG_API_HASH")
+PHONE = os.environ.get("TG_PHONE")
 
+def _load_env_file():
+    """Carga vars desde data/.env.local si no están en environment."""
+    env_file = DATA_DIR / ".env.local"
+    if not env_file.exists():
+        return
+    with open(env_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip().strip('"').strip("'")
+            if key in ("TG_API_ID", "TG_API_HASH", "TG_PHONE") and val:
+                os.environ[key] = val
+
+_load_env_file()
+
+# Re-leer después de cargar .env.local
+API_ID = int(os.environ["TG_API_ID"]) if os.environ.get("TG_API_ID") else None
+API_HASH = os.environ.get("TG_API_HASH")
+PHONE = os.environ.get("TG_PHONE")
+
+if not API_ID or not API_HASH:
+    raise RuntimeError(
+        "Credenciales de user bot no configuradas.\n"
+        "Configura TG_API_ID, TG_API_HASH, y TG_PHONE en el panel."
+    )
+
+# ── Mensajes ───────────────────────────────────────────────────────────
 def load_messages() -> dict:
-    """Carga mensajes desde messages.json. Cada idioma tiene steps con text y audio, y opcionalmente 'call'."""
     with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-    # Convertir a formato interno
     result = {}
     for lang, lang_data in data.items():
         steps = lang_data.get("steps", [])
@@ -43,7 +77,6 @@ def load_messages() -> dict:
 MESSAGES = load_messages()
 
 # ── Estado por usuario ────────────────────────────────────────────────
-# { chat_id: {"lang": "es", "step": 0, "last_seen": 1234567890} }
 user_state: dict[int, dict] = {}
 
 # ── Detección de idioma ───────────────────────────────────────────────
@@ -73,22 +106,16 @@ LANG_KEYWORDS = {
     ),
 }
 
-# Palabras que existen en varios idiomas — se ignoran para detección
 AMBIGUOUS = {"ok", "no", "si", "hey", "hi", "hello"}
 
 
 def detect_lang(text: str) -> str:
-    """Detect language from user message. Solo se usa en el primer mensaje.
-    Returns 'es', 'en', or 'fr'. Defaults to 'en'."""
     scores = {"es": 0, "en": 0, "fr": 0}
-
     for lang, pattern in LANG_KEYWORDS.items():
         matches = pattern.findall(text)
         for m in matches:
             if m.lower() not in AMBIGUOUS:
                 scores[lang] += 1.0
-
-    # Explicit language markers
     lang_markers = {
         "es": re.compile(r"\b(español|castellano|hablo español|hablo espanol)\b", re.IGNORECASE),
         "en": re.compile(r"\b(english|speak english)\b", re.IGNORECASE),
@@ -97,48 +124,58 @@ def detect_lang(text: str) -> str:
     for lang, marker in lang_markers.items():
         if marker.search(text):
             scores[lang] += 20
-
     if max(scores.values()) < 1:
-        return "en"  # fallback
-
+        return "en"
     return max(scores, key=scores.get)
 
 
 def is_expired(state: dict) -> bool:
-    """Check if state has expired (more than RESET_TIMEOUT since last msg)."""
     return time.time() - state.get("last_seen", 0) > RESET_TIMEOUT
 
 
-# ── Handlers ──────────────────────────────────────────────────────────
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id in user_state:
-        del user_state[chat_id]
-    # Silent start — no welcome message.
-    # Language detection happens on the user's first real message.
-    # Deep link: t.me/hmsg_bot?start=silent
+def load_messages_fresh():
+    """Recarga mensajes desde disco (para cambios desde el panel)."""
+    global MESSAGES
+    try:
+        MESSAGES = load_messages()
+    except Exception:
+        pass
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = (update.message.text or "").strip()
+# ── Cliente Telethon ───────────────────────────────────────────────────
+client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+
+
+# ── Handlers ───────────────────────────────────────────────────────────
+
+@client.on(events.NewMessage(incoming=True))
+async def handle_message(event):
+    """Maneja mensajes de texto entrantes (sin /start necesario)."""
+    # Solo chats privados (no grupos/canales)
+    if not event.is_private:
+        return
+
+    chat_id = event.chat_id
+    text = (event.message.message or "").strip()
     if not text:
         return
 
     now = time.time()
     state = user_state.get(chat_id)
 
+    # ── Comandos especiales ──
+    if text.startswith("/start") or text.startswith("/"):
+        return  # Ignorar comandos, sin respuesta
+
     # ── Nuevo ciclo o expired ──
     if state is None or is_expired(state):
         if state is not None:
-            logging.info("[chat=%s] EXPIRED (%.0fs idle) — new cycle", chat_id, now - state["last_seen"])
+            logging.info("[chat=%s] EXPIRED — new cycle", chat_id)
+        load_messages_fresh()
         detected = detect_lang(text)
         state = {"lang": detected, "step": 0, "last_seen": now}
         user_state[chat_id] = state
-        step_to_use = 0  # msg1
-
-    # ── Ciclo existente — idioma FIJO, solo avanza step ──
+        step_to_use = 0
     else:
         step_to_use = min(state["step"] + 1, 2)
         state["step"] = step_to_use
@@ -148,18 +185,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang_data = MESSAGES.get(lang, MESSAGES["en"])
     msg_text, audio_file = lang_data["steps"][step_to_use]
 
-    # Send text
-    await update.message.reply_text(msg_text)
+    # Enviar texto
+    await client.send_message(chat_id, msg_text)
 
-    # Send audio
+    # Enviar audio
     audio_path = AUDIO_DIR / audio_file
     if audio_path.exists():
-        with open(audio_path, "rb") as f:
-            await update.message.reply_audio(
-                audio=f,
-                title=f"Bot AutoReply ({lang.upper()})",
-                performer="AutoReply Bot",
-            )
+        await client.send_file(chat_id, str(audio_path), voice_note=False)
 
     logging.info(
         "[chat=%s lang=%s step=%s] %r → %r",
@@ -167,68 +199,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Responde cuando alguien intenta llamar por Telegram."""
-    chat_id = update.effective_chat.id
-    logging.info("[chat=%s] CALL received", chat_id)
+@client.on(events.NewMessage(incoming=True, func=lambda e: e.voice or e.video_note))
+async def handle_media_call(event):
+    """Responde a notas de voz / video (simula manejo de 'llamada')."""
+    if not event.is_private:
+        return
 
-    # Detectar idioma del usuario (por último estado conocido o mensaje)
+    chat_id = event.chat_id
+    logging.info("[chat=%s] VOICE/VIDEO (call-like) received", chat_id)
+
     state = user_state.get(chat_id)
     if state and not is_expired(state):
         lang = state["lang"]
     else:
-        lang = "en"  # Default si no hay historial
+        lang = "en"
 
     lang_data = MESSAGES.get(lang, MESSAGES["en"])
     call_data = lang_data.get("call", {"text": "📞 Llamada recibida", "audio": ""})
     msg_text = call_data.get("text", "📞 Llamada recibida")
     audio_file = call_data.get("audio", "")
 
-    # Enviar texto
     try:
-        await update.message.reply_text(msg_text)
-    except:
-        pass  # Puede que no haya chat activo
+        await client.send_message(chat_id, msg_text)
+    except Exception:
+        pass
 
-    # Enviar audio si existe
     if audio_file:
         audio_path = AUDIO_DIR / audio_file
         if audio_path.exists():
-            with open(audio_path, "rb") as f:
-                try:
-                    await update.message.reply_audio(
-                        audio=f,
-                        title=f"Bot AutoReply ({lang.upper()}) - Llamada",
-                        performer="AutoReply Bot",
-                    )
-                except:
-                    pass
+            try:
+                await client.send_file(chat_id, str(audio_path), voice_note=False)
+            except Exception:
+                pass
 
-    logging.info("[chat=%s lang=%s] CALL reply sent: %s", chat_id, lang, msg_text[:60])
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logging.error("Exception while handling an update: %s", context.error)
+    logging.info("[chat=%s lang=%s] CALL reply sent", chat_id, lang)
 
 
 # ── Main ──────────────────────────────────────────────────────────────
 
-def main():
+async def main():
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(message)s",
         level=logging.INFO,
     )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    logging.info("Starting Telegram User Bot...")
+    await client.start(phone=PHONE or (lambda: os.environ.get("TG_CODE", "")))
+    me = await client.get_me()
+    logging.info("Logged in as @%s (%s %s)", me.username, me.first_name, me.last_name or "")
+    logging.info("User bot ready — no /start needed.")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE | filters.ChatAction, handle_call))
-    app.add_error_handler(error_handler)
-
-    logging.info("Bot AutoReply starting... (token=%s...)", BOT_TOKEN[:8])
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

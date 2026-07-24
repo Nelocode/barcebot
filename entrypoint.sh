@@ -17,16 +17,21 @@ if [ -z "$(ls -A /app/data/audios 2>/dev/null)" ]; then
 fi
 
 # ── 1. Bot Telegram ──────────────────────────────────────────────────
-if [ -n "$AUTOREPLY_BOT_TOKEN" ] && [ "$AUTOREPLY_BOT_TOKEN" != "TU_TOKEN_AQUI" ]; then
-    echo "📱 Iniciando Bot Telegram..."
+# Cargar credenciales desde .env.local si no están en environment
+if [ -f /app/data/.env.local ]; then
+    export $(grep -v '^#' /app/data/.env.local | grep -E '^TG_(API_ID|API_HASH|PHONE)=' | xargs)
+fi
+
+if [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ]; then
+    echo "📱 Iniciando Bot Telegram (User Bot)..."
     nohup python bot.py > /tmp/bot_tg.log 2>&1 &
     echo "  → PID: $!"
 else
-    echo "⚠️  AUTOREPLY_BOT_TOKEN no configurado. Se configura desde el panel."
+    echo "⚠️  Credenciales de user bot no configuradas. Configura api_id, api_hash y phone desde el panel."
 fi
 
 # ── 2. Bot WhatsApp ──────────────────────────────────────────────────
-if [ -d "wa_auth" ] && [ "$(ls -A wa_auth 2>/dev/null)" ]; then
+if [ -d "/app/data/wa_auth" ] && [ "$(ls -A /app/data/wa_auth 2>/dev/null)" ]; then
     echo "💬 Iniciando Bot WhatsApp..."
     nohup node wa_bot.mjs > /tmp/bot_wa.log 2>&1 &
     echo "  → PID: $!"

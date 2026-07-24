@@ -91,21 +91,29 @@ label { color: #c8c8e0 !important; font-weight: 500; }
     <div class="card-body">
 
       <!-- ── Telegram ── -->
-      <h6 class="mb-2">📱 Telegram</h6>
+      <h6 class="mb-2">📱 Telegram (User Bot)</h6>
       <details class="mb-2">
-        <summary class="text-muted small" style="cursor:pointer;">📖 ¿Cómo crear un bot en Telegram?</summary>
+        <summary class="text-muted small" style="cursor:pointer;">📖 ¿Cómo obtener las credenciales?</summary>
         <ol class="small mt-2" style="padding-left:1.5rem;">
-          <li>Abre Telegram y busca <strong>@BotFather</strong></li>
-          <li>Envía <code>/newbot</code> y sigue las instrucciones</li>
-          <li>Elige un nombre y un username (termina en <em>bot</em>)</li>
-          <li>BotFather te dará un <strong>token</strong> (ej: <code>123456789:ABCdefGHIjkl...</code>)</li>
-          <li>Copia ese token y pégalo abajo</li>
+          <li>Ve a <a href="https://my.telegram.org/apps" target="_blank" style="color:#6ea8fe;">my.telegram.org/apps</a></li>
+          <li>Inicia sesión con el número de teléfono de la cuenta</li>
+          <li>Crea una aplicación (nombre cualquiera, plataforma "Desktop")</li>
+          <li>Copia el <strong>api_id</strong> y <strong>api_hash</strong> de abajo</li>
         </ol>
       </details>
+      <div class="row mb-2">
+        <div class="col-3">
+          <input id="tg-api-id" type="number" class="form-control form-control-sm" placeholder="api_id" style="font-family:monospace;font-size:0.8rem;">
+        </div>
+        <div class="col-5">
+          <input id="tg-api-hash" type="text" class="form-control form-control-sm" placeholder="api_hash" style="font-family:monospace;font-size:0.8rem;">
+        </div>
+        <div class="col-4">
+          <input id="tg-phone" type="text" class="form-control form-control-sm" placeholder="+57 300 123 4567" style="font-family:monospace;font-size:0.8rem;">
+        </div>
+      </div>
       <div class="d-flex align-items-center gap-2 mb-2">
-        <input id="tg-token-input" type="text" class="form-control form-control-sm" placeholder="Pega aquí el token de BotFather" style="flex:1;font-family:monospace;font-size:0.8rem;">
         <button class="btn btn-sm btn-primary" onclick="linkTelegram()">🔗 Vincular</button>
-        <button class="btn btn-sm btn-outline-light" onclick="testTelegram()">🔍 Probar</button>
       </div>
       <div id="tg-link-status" class="small text-muted mb-3"></div>
 
@@ -556,68 +564,51 @@ function showSetup() {
   fetch("/api/tg_status").then(r => r.json()).then(d => {
     const el = document.getElementById("tg-link-status");
     if (d.linked) {
-      el.innerHTML = '✅ <strong>Vinculado</strong> como @' + (d.bot_name || 'desconocido');
-      document.getElementById("tg-token-input").placeholder = 'Token ya configurado — pega uno nuevo para cambiarlo';
+      el.innerHTML = '✅ <strong>Vinculado</strong> como ' + (d.display_name || 'usuario');
+      document.getElementById("tg-api-id").placeholder = 'Ya configurado';
+      document.getElementById("tg-api-hash").placeholder = 'Ya configurado';
+      document.getElementById("tg-phone").placeholder = d.phone || 'Ya configurado';
     } else {
-      el.innerHTML = '⚠️ No hay token. Crea un bot en @BotFather y pega el token.';
+      el.innerHTML = '⚠️ Sin vincular. Ingresa api_id, api_hash y número de teléfono.';
     }
   }).catch(() => {});
 }
 
-async function testTelegram() {
-  const token = document.getElementById("tg-token-input").value.trim();
-  if (!token) { toast("❌ Pega un token primero", "error"); return; }
-  document.getElementById("tg-link-status").innerHTML = '🔄 Probando token...';
-  try {
-    const r = await fetch("/api/test_telegram", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({token})
-    });
-    const d = await r.json();
-    if (d.ok) {
-      toast("✅ Token válido — @" + d.bot_name, "success");
-      document.getElementById("tg-link-status").innerHTML = '✅ Token válido — @' + d.bot_name + '. Haz click en "🔗 Vincular" para guardarlo.';
-    } else {
-      toast("❌ " + (d.error || "Token inválido"), "error");
-      document.getElementById("tg-link-status").innerHTML = '❌ ' + (d.error || "Token inválido");
-    }
-  } catch(e) {
-    toast("❌ Error: " + e.message, "error");
-  }
-}
-
 async function linkTelegram() {
-  const token = document.getElementById("tg-token-input").value.trim();
-  if (!token) { toast("❌ Pega el token primero", "error"); return; }
-  if (!token.includes(":")) { toast("❌ Token inválido — debe tener formato 123456:ABC...", "error"); return; }
-  
+  const api_id = document.getElementById("tg-api-id").value.trim();
+  const api_hash = document.getElementById("tg-api-hash").value.trim();
+  const phone = document.getElementById("tg-phone").value.trim();
+
+  if (!api_id) { toast("❌ Ingresa el api_id", "error"); return; }
+  if (!api_hash) { toast("❌ Ingresa el api_hash", "error"); return; }
+  if (!phone) { toast("❌ Ingresa el número de teléfono", "error"); return; }
+
   const btn = event.target;
   btn.disabled = true;
-  btn.innerHTML = '⏳ Validando...';
-  document.getElementById("tg-link-status").innerHTML = '🔄 Validando token con Telegram...';
-  
+  btn.innerHTML = '⏳ Guardando...';
+  document.getElementById("tg-link-status").innerHTML = '🔄 Guardando credenciales...';
+
   try {
     const r = await fetch("/api/link_telegram", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({token})
+      body: JSON.stringify({api_id: parseInt(api_id), api_hash, phone})
     });
     const d = await r.json();
     if (d.ok) {
-      toast("✅ Telegram vinculado como @" + d.bot_name, "success");
-      document.getElementById("tg-link-status").innerHTML = '✅ <strong>Vinculado</strong> como @' + d.bot_name;
+      toast("✅ Credenciales guardadas. El bot se conectará como usuario.", "success");
+      document.getElementById("tg-link-status").innerHTML = '✅ <strong>Credenciales guardadas</strong>';
       setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
     } else {
-      toast("❌ " + (d.error || "Error al vincular"), "error");
+      toast("❌ " + (d.error || "Error"), "error");
       document.getElementById("tg-link-status").innerHTML = '❌ ' + (d.error || "Error");
     }
   } catch(e) {
-    toast("❌ Error de conexión: " + e.message, "error");
-    document.getElementById("tg-link-status").innerHTML = '❌ Error de conexión';
+    toast("❌ Error: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '🔗 Vincular';
   }
-  btn.disabled = false;
-  btn.innerHTML = '🔗 Vincular';
 }
 
 async function launchWaAndShowQr() {
@@ -676,19 +667,16 @@ def save_messages_json(data):
     with open(MESSAGES_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-def get_bot_token():
-    """Obtiene el token del bot desde environment o desde archivo .env.local."""
-    token = os.environ.get("AUTOREPLY_BOT_TOKEN")
-    if token:
-        return token
-    # Fallback: leer desde .env.local en el directorio del bot
+def _read_env_var(key: str) -> str | None:
+    """Lee una variable desde data/.env.local."""
     env_file = DATA_DIR / ".env.local"
-    if env_file.exists():
-        with open(env_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("AUTOREPLY_BOT_TOKEN="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    if not env_file.exists():
+        return None
+    with open(env_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(f"{key}="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
     return None
 
 def bot_is_running():
@@ -988,92 +976,38 @@ def api_upload_assemble():
     return jsonify({"ok": True, "filename": audio_filename})
 
 def is_bot_running():
-    """Verifica si el bot responde haciendo un ping a Telegram API."""
-    import subprocess
-    try:
-        # Usar getMe para verificar conectividad
-        result = subprocess.run(
-            ["curl", "-s", "--connect-timeout", "5",
-             f"https://api.telegram.org/bot{get_bot_token()}/getMe"],
-            capture_output=True, text=True, timeout=10
-        )
-        return '"ok":true' in result.stdout
-    except:
-        return False
+    """Verifica si el bot responde haciendo un ping a Telegram API (user bot no tiene getMe)."""
+    # Con user bot, verificamos que el proceso esté corriendo
+    return bot_is_running()
 
 @app.route("/api/tg_status")
 def api_tg_status():
-    """Estado de la vinculación de Telegram."""
-    token = get_bot_token()
-    linked = token is not None
+    """Estado de la vinculación de Telegram (user bot)."""
+    api_id = os.environ.get("TG_API_ID") or _read_env_var("TG_API_ID")
+    linked = bool(api_id)
     result = {"linked": linked}
     if linked:
-        # Obtener nombre del bot desde el token
-        try:
-            import subprocess
-            r = subprocess.run(
-                ["curl", "-s", "--connect-timeout", "5",
-                 f"https://api.telegram.org/bot{token}/getMe"],
-                capture_output=True, text=True, timeout=10
-            )
-            import json
-            data = json.loads(r.stdout)
-            if data.get("ok"):
-                result["bot_name"] = data["result"].get("username", "")
-                result["bot_id"] = data["result"].get("id", "")
-        except:
-            pass
-        # Mostrar solo primeros 8 chars del token
-        result["token_preview"] = token[:8] + "..." if len(token) > 8 else token
+        phone = os.environ.get("TG_PHONE") or _read_env_var("TG_PHONE") or ""
+        # Mostrar últimos 4 dígitos del teléfono
+        if phone:
+            result["display_name"] = "📱 ..." + phone[-4:] if len(phone) > 4 else phone
+            result["phone"] = phone
     return jsonify(result)
 
-@app.route("/api/test_telegram", methods=["POST"])
-def api_test_telegram():
-    """Prueba un token sin guardarlo."""
-    import subprocess, json
-    data = request.get_json()
-    token = (data.get("token") or "").strip()
-    if not token or ":" not in token:
-        return jsonify({"ok": False, "error": "Token inválido"}), 400
-    try:
-        r = subprocess.run(
-            ["curl", "-s", "--connect-timeout", "5",
-             f"https://api.telegram.org/bot{token}/getMe"],
-            capture_output=True, text=True, timeout=10
-        )
-        resp = json.loads(r.stdout)
-        if resp.get("ok"):
-            return jsonify({"ok": True, "bot_name": resp["result"].get("username", "desconocido")})
-        else:
-            return jsonify({"ok": False, "error": "Token inválido o revocado"})
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Error: {str(e)}"}), 500
 
 @app.route("/api/link_telegram", methods=["POST"])
 def api_link_telegram():
-    """Vincula un token de Telegram, lo guarda en .env.local y reinicia el bot."""
-    import subprocess, json
+    """Guarda credenciales de user bot (api_id, api_hash, phone) en .env.local y reinicia."""
+    import subprocess, sys
     
     data = request.get_json()
-    token = (data.get("token") or "").strip()
-    
-    if not token or ":" not in token:
-        return jsonify({"ok": False, "error": "Token inválido"}), 400
-    
-    # Validar token con Telegram API
-    try:
-        r = subprocess.run(
-            ["curl", "-s", "--connect-timeout", "5",
-             f"https://api.telegram.org/bot{token}/getMe"],
-            capture_output=True, text=True, timeout=10
-        )
-        resp = json.loads(r.stdout)
-        if not resp.get("ok"):
-            return jsonify({"ok": False, "error": "Token inválido o revocado"}), 400
-        bot_name = resp["result"].get("username", "desconocido")
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"No se pudo validar: {str(e)}"}), 500
-    
+    api_id = data.get("api_id")
+    api_hash = (data.get("api_hash") or "").strip()
+    phone = (data.get("phone") or "").strip()
+
+    if not api_id or not api_hash or not phone:
+        return jsonify({"ok": False, "error": "api_id, api_hash y phone son requeridos"}), 400
+
     # Guardar en .env.local
     env_file = DATA_DIR / ".env.local"
     try:
@@ -1081,31 +1015,42 @@ def api_link_telegram():
         if env_file.exists():
             with open(env_file, "r") as f:
                 lines = f.readlines()
-        
-        # Reemplazar o agregar la línea del token
-        found = False
+
         new_lines = []
+        replaced = {"TG_API_ID": False, "TG_API_HASH": False, "TG_PHONE": False}
         for line in lines:
-            if line.strip().startswith("AUTOREPLY_BOT_TOKEN="):
-                new_lines.append(f"AUTOREPLY_BOT_TOKEN={token}\n")
-                found = True
+            stripped = line.strip()
+            if stripped.startswith("TG_API_ID="):
+                new_lines.append(f"TG_API_ID={api_id}\n")
+                replaced["TG_API_ID"] = True
+            elif stripped.startswith("TG_API_HASH="):
+                new_lines.append(f"TG_API_HASH={api_hash}\n")
+                replaced["TG_API_HASH"] = True
+            elif stripped.startswith("TG_PHONE="):
+                new_lines.append(f"TG_PHONE={phone}\n")
+                replaced["TG_PHONE"] = True
             else:
                 new_lines.append(line)
-        if not found:
-            new_lines.append(f"AUTOREPLY_BOT_TOKEN={token}\n")
-        
+        for key, found in replaced.items():
+            if not found:
+                val = str(api_id) if key == "TG_API_ID" else (api_hash if key == "TG_API_HASH" else phone)
+                new_lines.append(f"{key}={val}\n")
+
         with open(env_file, "w") as f:
             f.writelines(new_lines)
     except Exception as e:
-        return jsonify({"ok": False, "error": f"No se pudo guardar token: {str(e)}"}), 500
-    
-    # Reiniciar el bot de Telegram de forma multiplataforma
-    import subprocess, sys, time
+        return jsonify({"ok": False, "error": f"No se pudo guardar: {str(e)}"}), 500
+
+    # Setear en el proceso actual también
+    os.environ["TG_API_ID"] = str(api_id)
+    os.environ["TG_API_HASH"] = api_hash
+    os.environ["TG_PHONE"] = phone
+
+    # Reiniciar bot
     restart_script = str(BASE_DIR / "restart_bot.py")
     python = sys.executable
     env = os.environ.copy()
-    env["AUTOREPLY_BOT_TOKEN"] = token
-    
+
     if sys.platform == "win32":
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -1123,8 +1068,8 @@ def api_link_telegram():
             env=env,
             start_new_session=True
         )
-    
-    return jsonify({"ok": True, "bot_name": bot_name, "message": f"Vinculado como @{bot_name}"})
+
+    return jsonify({"ok": True, "message": "Credenciales guardadas. El bot se conectará como usuario."})
 
 @app.route("/api/status")
 def api_status():
@@ -1221,9 +1166,7 @@ def api_restart_bot():
 
     try:
         env = os.environ.copy()
-        token = get_bot_token()
-        if token:
-            env["AUTOREPLY_BOT_TOKEN"] = token
+        # Pasar credenciales del user bot
         
         if sys.platform == "win32":
             startupinfo = subprocess.STARTUPINFO()

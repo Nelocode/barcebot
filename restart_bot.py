@@ -43,20 +43,23 @@ def find_bot_pids():
 
 
 def main():
-    token = os.environ.get("AUTOREPLY_BOT_TOKEN")
-    if not token:
+    api_id = os.environ.get("TG_API_ID")
+    api_hash = os.environ.get("TG_API_HASH")
+
+    if not api_id or not api_hash:
         # Intentar leer de .env.local
         env_file = BASE_DIR / "data" / ".env.local"
         if env_file.exists():
             with open(env_file) as f:
                 for line in f:
                     line = line.strip()
-                    if line.startswith("AUTOREPLY_BOT_TOKEN="):
-                        token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        break
-    
-    if not token:
-        print("ERROR: AUTOREPLY_BOT_TOKEN no encontrado")
+                    if line.startswith("TG_API_ID="):
+                        api_id = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    elif line.startswith("TG_API_HASH="):
+                        api_hash = line.split("=", 1)[1].strip().strip('"').strip("'")
+
+    if not api_id or not api_hash:
+        print("ERROR: TG_API_ID y TG_API_HASH no configurados")
         sys.exit(1)
 
     print("=== Restarting bot ===")
@@ -82,7 +85,6 @@ def main():
     
     with open(log_file, "a") as f:
         env = os.environ.copy()
-        env["AUTOREPLY_BOT_TOKEN"] = token
         
         if sys.platform == "win32":
             startupinfo = subprocess.STARTUPINFO()
