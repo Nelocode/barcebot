@@ -1471,7 +1471,7 @@ def wa_is_running():
             if "wa_bot.mjs" in lines:
                 return True
             # Si hay carpeta wa_auth/ pero no hay proceso, está desconectado
-            if (BASE_DIR / "wa_auth").exists() and any((BASE_DIR / "wa_auth").iterdir()):
+            if (DATA_DIR / "wa_auth").exists() and any((DATA_DIR / "wa_auth").iterdir()):
                 return False  # Auth exists but process dead
             return None  # No vinculado aún
         else:
