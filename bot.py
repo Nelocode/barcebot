@@ -27,14 +27,17 @@ RESET_TIMEOUT = 3600  # 1 hora en segundos
 MESSAGES_FILE = Path(__file__).parent / "messages.json"
 
 def load_messages() -> dict:
-    """Carga mensajes desde messages.json. Cada idioma tiene steps con text y audio."""
+    """Carga mensajes desde messages.json. Cada idioma tiene steps con text y audio, y opcionalmente 'call'."""
     with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-    # Convertir a formato interno: {"es": [(text, audio), ...], ...}
+    # Convertir a formato interno
     result = {}
     for lang, lang_data in data.items():
         steps = lang_data.get("steps", [])
-        result[lang] = [(s["text"], s["audio"]) for s in steps]
+        result[lang] = {
+            "steps": [(s["text"], s["audio"]) for s in steps],
+            "call": lang_data.get("call", {"text": "📞 Llamada recibida", "audio": ""})
+        }
     return result
 
 MESSAGES = load_messages()
@@ -144,8 +147,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["last_seen"] = now
 
     lang = state["lang"]
-    messages = MESSAGES.get(lang, MESSAGES["en"])
-    msg_text, audio_file = messages[step_to_use]
+    lang_data = MESSAGES.get(lang, MESSAGES["en"])
+    msg_text, audio_file = lang_data["steps"][step_to_use]
 
     # Send text
     await update.message.reply_text(msg_text)
@@ -166,6 +169,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Responde cuando alguien intenta llamar por Telegram."""
+    chat_id = update.effective_chat.id
+    logging.info("[chat=%s] CALL received", chat_id)
+
+    # Detectar idioma del usuario (por último estado conocido o mensaje)
+    state = user_state.get(chat_id)
+    if state and not is_expired(state):
+        lang = state["lang"]
+    else:
+        lang = "en"  # Default si no hay historial
+
+    lang_data = MESSAGES.get(lang, MESSAGES["en"])
+    call_data = lang_data.get("call", {"text": "📞 Llamada recibida", "audio": ""})
+    msg_text = call_data.get("text", "📞 Llamada recibida")
+    audio_file = call_data.get("audio", "")
+
+    # Enviar texto
+    try:
+        await update.message.reply_text(msg_text)
+    except:
+        pass  # Puede que no haya chat activo
+
+    # Enviar audio si existe
+    if audio_file:
+        audio_path = AUDIO_DIR / audio_file
+        if audio_path.exists():
+            with open(audio_path, "rb") as f:
+                try:
+                    await update.message.reply_audio(
+                        audio=f,
+                        title=f"Bot AutoReply ({lang.upper()}) - Llamada",
+                        performer="AutoReply Bot",
+                    )
+                except:
+                    pass
+
+    logging.info("[chat=%s lang=%s] CALL reply sent: %s", chat_id, lang, msg_text[:60])
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error("Exception while handling an update: %s", context.error)
 
@@ -182,6 +225,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE | filters.ChatAction, handle_call))
     app.add_error_handler(error_handler)
 
     logging.info("Bot AutoReply starting... (token=%s...)", BOT_TOKEN[:8])

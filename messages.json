@@ -17,7 +17,11 @@
         "text": "🔄 Tu solicitud es importante. Por favor permanece en línea.",
         "audio": "es_msg3.mp3"
       }
-    ]
+    ],
+    "call": {
+      "text": "📞 Has recibido una llamada. Te atenderemos en breve.",
+      "audio": "es_call.mp3"
+    }
   },
   "en": {
     "lang_name": "English",
@@ -37,7 +41,11 @@
         "text": "🔄 Your request matters to us. Please stay on the line.",
         "audio": "en_msg3.mp3"
       }
-    ]
+    ],
+    "call": {
+      "text": "📞 You have a missed call. We will get back to you shortly.",
+      "audio": "en_call.mp3"
+    }
   },
   "fr": {
     "lang_name": "Français",
@@ -49,7 +57,7 @@
       },
       {
         "step": 2,
-        "text": "⏳ Merci d'avoir patienté. Nous assignons un agent pour vous.",
+        "text": "⏳ Merci d avoir patienté. Nous assignons un agent pour vous.",
         "audio": "fr_msg2.mp3"
       },
       {
@@ -57,6 +65,10 @@
         "text": "🔄 Votre demande est importante pour nous. Veuillez rester en ligne.",
         "audio": "fr_msg3.mp3"
       }
-    ]
+    ],
+    "call": {
+      "text": "📞 Vous avez un appel manqué. Nous vous rappellerons bientôt.",
+      "audio": "fr_call.mp3"
+    }
   }
 }

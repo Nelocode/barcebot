@@ -262,6 +262,37 @@ function renderSteps(data) {
   });
 
   html += `</div></div>`;
+
+  // ── Sección de Llamada ──
+  const callData = langData.call || { text: '📞 Llamada recibida', audio: '' };
+  const callAudioPath = callData.audio ? `/api/audio/${callData.audio}` : '';
+  html += `
+  <div class="card mt-3">
+    <div class="card-header">
+      <span>📞 Llamada — mensaje para cuando alguien llama</span>
+    </div>
+    <div class="card-body">
+      <div class="row g-3">
+        <div class="col-md-8">
+          <label class="form-label small">Texto de llamada</label>
+          <textarea class="form-control" onchange="saveCallText('${lang}', this.value)">${escapeHtml(callData.text)}</textarea>
+        </div>
+        <div class="col-md-4">
+          <label class="form-label small">Audio de llamada</label>
+          ${callAudioPath ? `
+          <div class="audio-preview mb-2">
+            <audio controls src="${callAudioPath}"></audio>
+            <span class="small text-muted">${callData.audio}</span>
+          </div>` : '<div class="mb-2 small text-muted">🎵 Sin audio aún</div>'}
+          <div class="input-group input-group-sm">
+            <input type="file" class="form-control form-control-sm" accept="audio/mpeg,audio/mp3"
+                   onchange="uploadCallAudio('${lang}', this.files[0])">
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+
   document.getElementById("steps-container").innerHTML = html;
 }
 
@@ -349,6 +380,42 @@ async function removeStep(lang, step) {
 function previewLang(lang) {
   // Pequeña simulación de cómo se ve desde Telegram
   window.open("/preview/" + lang, "_blank", "width=400,height=600");
+}
+
+async function saveCallText(lang, text) {
+  try {
+    const r = await fetch("/api/messages", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({lang, text, action: "edit_call_text"})
+    });
+    const resp = await r.json();
+    if (resp.ok) toast("📞 Mensaje de llamada guardado");
+    else toast("❌ Error: " + resp.error, "error");
+  } catch(e) {
+    toast("❌ Error: " + e.message, "error");
+  }
+}
+
+async function uploadCallAudio(lang, file) {
+  if (!file) return;
+  const formData = new FormData();
+  formData.append("audio", file);
+  formData.append("lang", lang);
+  formData.append("type", "call");
+
+  try {
+    const r = await fetch("/api/upload_call_audio", { method: "POST", body: formData });
+    const resp = await r.json();
+    if (resp.ok) {
+      toast("🎵 Audio de llamada subido: " + resp.filename);
+      loadData();
+    } else {
+      toast("❌ Error: " + resp.error, "error");
+    }
+  } catch(e) {
+    toast("❌ Error: " + e.message, "error");
+  }
 }
 
 async function restartBot() {
@@ -714,7 +781,46 @@ def api_messages():
         save_messages_json(messages)
         return jsonify({"ok": True, "removed": removed})
 
+    elif action == "edit_call_text":
+        text = data.get("text", "").strip()
+        if "call" not in lang_data:
+            lang_data["call"] = {"text": "", "audio": ""}
+        lang_data["call"]["text"] = text
+        save_messages_json(messages)
+        return jsonify({"ok": True})
+
     return jsonify({"ok": False, "error": f"Unknown action: {action}"}), 400
+
+@app.route("/api/upload_call_audio", methods=["POST"])
+def api_upload_call_audio():
+    """Sube audio para el mensaje de llamada."""
+    if "audio" not in request.files:
+        return jsonify({"ok": False, "error": "No audio file"}), 400
+    
+    lang = request.form.get("lang")
+    if not lang:
+        return jsonify({"ok": False, "error": "lang required"}), 400
+    
+    file = request.files["audio"]
+    if not file.filename.endswith((".mp3", ".ogg", ".wav")):
+        return jsonify({"ok": False, "error": "Solo MP3, OGG o WAV"}), 400
+    
+    messages = load_messages_json()
+    if lang not in messages:
+        return jsonify({"ok": False, "error": f"Idioma '{lang}' no existe"}), 400
+    
+    audio_filename = f"{lang}_call.mp3"
+    audio_path = AUDIO_DIR / audio_filename
+    file.save(str(audio_path))
+    
+    # Actualizar messages.json con el audio de llamada
+    if "call" not in messages[lang]:
+        messages[lang]["call"] = {"text": "📞 Llamada recibida", "audio": audio_filename}
+    else:
+        messages[lang]["call"]["audio"] = audio_filename
+    save_messages_json(messages)
+    
+    return jsonify({"ok": True, "filename": audio_filename, "path": str(audio_path)})
 
 @app.route("/api/upload_audio", methods=["POST"])
 def api_upload_audio():

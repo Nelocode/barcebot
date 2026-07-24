@@ -23,7 +23,10 @@ function loadMessages() {
   const data = JSON.parse(raw);
   const result = {};
   for (const [lang, langData] of Object.entries(data)) {
-    result[lang] = langData.steps.map(s => ({ text: s.text, audio: s.audio }));
+    result[lang] = {
+      steps: langData.steps.map(s => ({ text: s.text, audio: s.audio })),
+      call: langData.call || { text: '📞 Llamada recibida', audio: '' }
+    };
   }
   return result;
 }
@@ -87,9 +90,14 @@ function isExpired(state) {
 
 // ── Obtener mensaje para un paso ──
 function getMessage(lang, step) {
-  const msgs = MESSAGES[lang] || MESSAGES['en'];
-  const idx = Math.min(step, msgs.length - 1);
-  return msgs[idx];
+  const data = MESSAGES[lang] || MESSAGES['en'];
+  const idx = Math.min(step, data.steps.length - 1);
+  return data.steps[idx];
+}
+
+function getCallMessage(lang) {
+  const data = MESSAGES[lang] || MESSAGES['en'];
+  return data.call || { text: '📞 Llamada recibida', audio: '' };
 }
 
 // ── Leer archivo de audio como buffer ──
@@ -153,6 +161,50 @@ async function startBot() {
 
     if (connection === 'open') {
       console.log(`[WA] ✅ Conectado como ${sock.user?.name || sock.user?.id}`);
+    }
+  });
+
+  // ── Manejar llamadas entrantes ──
+  sock.ev.on('call', async (call) => {
+    if (call.status === 'offer') {
+      const jid = call.from;
+      console.log(`[WA ${jid}] CALL received (offer)`);
+
+      // Rechazar la llamada para que no siga sonando
+      try {
+        await sock.rejectCall(call.id, call.from);
+      } catch(e) {
+        console.error('[WA] Error rejecting call:', e.message);
+      }
+
+      // Detectar idioma
+      let lang = 'en';
+      const state = userState.get(jid);
+      if (state && !isExpired(state)) {
+        lang = state.lang;
+      }
+
+      const callMsg = getCallMessage(lang);
+      console.log(`[WA ${jid} lang=${lang}] CALL reply: "${callMsg.text.slice(0, 40)}"`);
+
+      // Enviar texto
+      await sock.sendMessage(jid, { text: callMsg.text });
+
+      // Enviar audio si existe
+      if (callMsg.audio) {
+        const audioBuffer = readAudio(callMsg.audio);
+        if (audioBuffer) {
+          try {
+            await sock.sendMessage(jid, {
+              audio: audioBuffer,
+              mimetype: 'audio/mpeg',
+              ptt: false,
+            });
+          } catch (err) {
+            console.error(`[WA] Error enviando audio de llamada a ${jid}:`, err.message);
+          }
+        }
+      }
     }
   });
 
