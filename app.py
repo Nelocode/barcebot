@@ -1442,23 +1442,17 @@ def api_link_botfather():
 
 
 def bf_is_running():
-    """Verifica si el BotFather bot está corriendo (proceso botfather_bot.py)."""
+    """Verifica si el BotFather bot está corriendo (por archivo PID)."""
+    pid_file = DATA_DIR / "botfather.pid"
     try:
-        if sys.platform == "win32":
-            result = subprocess.run(
-                ['powershell.exe', '-Command',
-                 "Get-CimInstance Win32_Process -Filter \"name = 'python.exe'\" | "
-                 "Select-Object CommandLine | Format-Table -HideTableHeaders -AutoSize"],
-                capture_output=True, text=True, timeout=5
-            )
-            return "botfather_bot.py" in result.stdout.lower()
-        else:
-            # Usar ps aux que está disponible en cualquier Linux
-            result = subprocess.run(
-                ["ps", "aux"], capture_output=True, text=True, timeout=5
-            )
-            return "botfather_bot.py" in result.stdout
-    except:
+        if not pid_file.exists():
+            return False
+        with open(pid_file, "r") as f:
+            pid = int(f.read().strip())
+        # Verificar que el proceso siga vivo
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
         return False
 
 def wa_is_running():
@@ -1613,13 +1607,17 @@ def api_start_botfather():
         
         bot_script = str(BASE_DIR / "botfather_bot.py")
         log_file = str(BASE_DIR / "botfather_bot.log")
+        pid_file = str(DATA_DIR / "botfather.pid")
         with open(log_file, "a") as f:
             f.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 [sys.executable, bot_script],
                 stdout=f, stderr=subprocess.STDOUT,
                 start_new_session=True
             )
+            # Guardar PID
+            with open(pid_file, "w") as pf:
+                pf.write(str(proc.pid))
         return jsonify({"ok": True, "message": "BotFather iniciado"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
