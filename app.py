@@ -25,19 +25,18 @@ TEMPLATE = r"""<!DOCTYPE html>
 <title>Bot AutoReply — Admin</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
 <style>
-body { background: #f0f2f5; color: #1a1a2e; font-family: system-ui, -apple-system, sans-serif; }
-.card { background: #ffffff; border: 1px solid #dde1e6; border-radius: 12px; margin-bottom: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-.card-header { background: #f8f9fb; border-bottom: 1px solid #dde1e6; font-weight: 600; color: #1a1a2e; border-radius: 12px 12px 0 0 !important; }
-.form-control, .form-select { background: #ffffff; border: 1px solid #c8cdd3; color: #1a1a2e; }
-.form-control:focus { background: #ffffff; border-color: #4a90d9; color: #1a1a2e; box-shadow: 0 0 0 0.2rem rgba(74,144,217,0.2); }
-.form-control::placeholder { color: #8a8fa8; }
-.form-control-sm { font-size: 0.85rem; }
-.btn-primary { background: #4a90d9; border: none; color: #fff; }
+body { background: #0f0f1a; color: #e8e8f0; font-family: system-ui, -apple-system, sans-serif; }
+.card { background: #1a1a2e; border: 1px solid #2a2a4a; border-radius: 12px; margin-bottom: 1.5rem; }
+.card-header { background: #16213e; border-bottom: 1px solid #2a2a4a; font-weight: 600; color: #c8d8f0; border-radius: 12px 12px 0 0 !important; }
+.form-control, .form-select { background: #12122a; border: 1px solid #3a3a5a; color: #e8e8f0; }
+.form-control:focus { background: #1a1a32; border-color: #5a9af0; color: #ffffff; box-shadow: 0 0 0 0.2rem rgba(90,154,240,0.2); }
+.form-control::placeholder { color: #6a6a8a; }
+.btn-primary { background: #4a90d9; border: none; color: #fff; font-weight: 500; }
 .btn-primary:hover { background: #357abd; }
 .btn-danger { background: #e74c3c; border: none; color: #fff; }
 .btn-success { background: #27ae60; border: none; color: #fff; }
-.btn-outline-light { border-color: #c8cdd3; color: #1a1a2e; }
-.btn-outline-light:hover { background: #e9ecef; border-color: #c8cdd3; color: #1a1a2e; }
+.btn-outline-light { border-color: #3a3a5a; color: #c8c8e0; }
+.btn-outline-light:hover { background: #2a2a4a; border-color: #5a5a7a; color: #ffffff; }
 .language-tabs { display: flex; gap: 8px; margin-bottom: 1rem; }
 .language-tabs .btn { flex: 1; }
 .badge-es { background: #e67e22; color: #fff; }
@@ -46,17 +45,18 @@ body { background: #f0f2f5; color: #1a1a2e; font-family: system-ui, -apple-syste
 .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
 .status-online { background: #27ae60; }
 .status-offline { background: #e74c3c; }
-.step-label { font-size: 0.85rem; color: #5f6b7a; text-transform: uppercase; letter-spacing: 1px; }
-textarea { min-height: 60px; resize: vertical; }
-hr { border-color: #dde1e6; }
-.text-muted { color: #6c7a8c !important; }
+.step-label { font-size: 0.85rem; color: #8a8aaa; text-transform: uppercase; letter-spacing: 1px; }
+textarea { min-height: 60px; resize: vertical; background: #12122a; border: 1px solid #3a3a5a; color: #e8e8f0; }
+hr { border-color: #2a2a4a; }
+.text-muted { color: #8a8aaa !important; }
 #toast-container { position: fixed; top: 20px; right: 20px; z-index: 9999; }
-.toast-msg { background: #ffffff; color: #1a1a2e; border: 1px solid #dde1e6; padding: 12px 20px; border-radius: 8px; margin-bottom: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); animation: fadeIn 0.3s; }
+.toast-msg { background: #1a1a2e; color: #e8e8f0; border: 1px solid #2a2a4a; padding: 12px 20px; border-radius: 8px; margin-bottom: 8px; animation: fadeIn 0.3s; }
 .toast-msg.success { border-left: 4px solid #27ae60; }
 .toast-msg.error { border-left: 4px solid #e74c3c; }
 @keyframes fadeIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
-summary { color: #4a90d9; }
-code { background: #eef1f5; color: #d63384; padding: 2px 6px; border-radius: 4px; }
+summary { color: #5a9af0; cursor: pointer; }
+code { background: #12122a; color: #e8a0d0; padding: 2px 6px; border-radius: 4px; }
+.badge.bg-secondary { background: #2a2a4a !important; color: #b0b0d0 !important; }
 </style>
 </head>
 <body>
