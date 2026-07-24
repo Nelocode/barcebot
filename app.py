@@ -1046,6 +1046,15 @@ def api_upload_chunk():
 @app.route("/api/upload_assemble", methods=["POST"])
 def api_upload_assemble():
     """Reensambla los chunks en el archivo final de audio."""
+    try:
+        return _do_upload_assemble()
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
+
+
+def _do_upload_assemble():
     data = request.get_json()
     if not data:
         return jsonify({"ok": False, "error": "JSON required"}), 400
@@ -1089,12 +1098,16 @@ def api_upload_assemble():
         audio_filename = steps[step]["audio"]
 
     # Ensamblar
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     audio_path = AUDIO_DIR / audio_filename
-    with open(audio_path, "wb") as out:
-        for i in range(total_chunks):
-            chunk_path = temp_dir / f"chunk_{i:04d}"
-            with open(chunk_path, "rb") as f_in:
-                out.write(f_in.read())
+    try:
+        with open(audio_path, "wb") as out:
+            for i in range(total_chunks):
+                chunk_path = temp_dir / f"chunk_{i:04d}"
+                with open(chunk_path, "rb") as f_in:
+                    out.write(f_in.read())
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Error escribiendo audio: {str(e)}"}), 500
 
     # Si es call, actualizar messages.json
     if upload_type == "call":
