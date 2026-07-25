@@ -14,6 +14,7 @@ import { createWhatsAppCallHealth } from './wa_call_health.mjs';
 import { PersistentInteractionState } from './interaction_state.mjs';
 import { createWhatsAppMessageHandler } from './wa_message_handler.mjs';
 import { KeyedSerialQueue } from './keyed_serial_queue.mjs';
+import { classifyWhatsAppDisconnect } from './wa_disconnect_policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = path.resolve(process.env.BOT_DIR || __dirname);
@@ -96,6 +97,19 @@ function scheduleReconnect() {
       scheduleReconnect();
     });
   }, RECONNECT_DELAY_MS);
+}
+
+function terminateInvalidSession() {
+  // `fs.watchFile` otherwise keeps Node alive after Baileys has declared the
+  // credentials unusable. Preserve the health snapshot so the panel can
+  // explain that a new QR is required.
+  shuttingDown = true;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  if (linkExpiryTimer) clearTimeout(linkExpiryTimer);
+  linkExpiryTimer = null;
+  fs.unwatchFile(MESSAGES_FILE);
+  setImmediate(() => process.exit(0));
 }
 
 // ── Cargar mensajes ──
@@ -284,30 +298,21 @@ async function startBot() {
       const disconnectStatus = lastDisconnect?.error instanceof Boom
         ? lastDisconnect.error.output?.statusCode
         : (lastDisconnect?.error?.output?.statusCode ?? lastDisconnect?.error?.data?.statusCode);
-      const invalidSessionStatuses = new Set([
-        DisconnectReason.loggedOut,
-        DisconnectReason.badSession,
-        DisconnectReason.connectionReplaced,
-        DisconnectReason.multideviceMismatch,
-        DisconnectReason.forbidden,
-      ]);
-      const reauthRequired = invalidSessionStatuses.has(disconnectStatus);
-      const shouldReconnect = !reauthRequired;
+      const disconnect = classifyWhatsAppDisconnect(disconnectStatus);
       callHealth.record({
         type: 'connection',
         state: 'closed',
-        reason: shouldReconnect
-          ? 'transient'
-          : disconnectStatus === DisconnectReason.loggedOut ? 'logged_out' : 'session_invalid',
-        reauthRequired,
+        reason: disconnect.reason,
+        reauthRequired: disconnect.reauthRequired,
       });
 
-      console.log(`[WA] Conexión cerrada. Estado: ${disconnectStatus ?? 'unknown'}. Reconnect: ${shouldReconnect}`);
+      console.log(`[WA] Conexión cerrada. Estado: ${disconnectStatus ?? 'unknown'}. Reconnect: ${disconnect.shouldReconnect}`);
 
-      if (shouldReconnect) {
-        scheduleReconnect();
+      if (disconnect.terminateWorker) {
+        console.log('[WA] Sesión inválida. Vuelve a vincularla desde el panel.');
+        terminateInvalidSession();
       } else {
-        console.log('[WA] Sesión cerrada. Vuelve a escanear QR borrando wa_auth/');
+        scheduleReconnect();
       }
     }
 

@@ -2060,7 +2060,17 @@ def _read_tg_interaction_health() -> dict:
         "connection": "unknown",
         "raw_phone_revision": None,
         "phone_subtype": "never",
+        "phone_revisions": {
+            key: None
+            for key in (
+                "requested", "waiting", "accepted", "active",
+                "discarded", "empty", "other",
+            )
+        },
         "service_call_revision": None,
+        "service_call_status": "never",
+        "service_peer_source": "never",
+        "missed_call_poll": "starting",
         "classified_revision": None,
         "last_kind": "never",
         "last_response": "never",
@@ -2088,7 +2098,36 @@ def _read_tg_interaction_health() -> dict:
     for key in ("raw_phone_revision", "service_call_revision", "classified_revision"):
         result[key] = _safe_uuid(raw.get(key))
     result["phone_subtype"] = _safe_enum(
-        raw.get("phone_subtype"), {"requested", "waiting", "other", "never"}, "other"
+        raw.get("phone_subtype"),
+        {
+            "requested", "waiting", "accepted", "active",
+            "discarded", "empty", "other", "never",
+        },
+        "other",
+    )
+    raw_phone_revisions = (
+        raw.get("phone_revisions")
+        if isinstance(raw.get("phone_revisions"), dict)
+        else {}
+    )
+    result["phone_revisions"] = {
+        key: _safe_uuid(raw_phone_revisions.get(key))
+        for key in result["phone_revisions"]
+    }
+    result["service_call_status"] = _safe_enum(
+        raw.get("service_call_status"),
+        {"never", "seen", "ignored", "classified", "delivery_failed", "processed"},
+        "never",
+    )
+    result["service_peer_source"] = _safe_enum(
+        raw.get("service_peer_source"),
+        {"never", "message", "dialog", "update_entities", "cache", "unresolved"},
+        "never",
+    )
+    result["missed_call_poll"] = _safe_enum(
+        raw.get("missed_call_poll"),
+        {"starting", "healthy", "failed"},
+        "failed",
     )
     result["last_kind"] = _safe_enum(
         raw.get("last_kind"), {"call", "content", "never"}, "never"

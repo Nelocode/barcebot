@@ -11,12 +11,14 @@ confirma después de la entrega, evitando duplicados sin perder reintentos.
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
 from pathlib import Path
 import re
 import time
+from types import SimpleNamespace
 import uuid
 
 from telethon import TelegramClient, events, utils
@@ -25,9 +27,12 @@ from telethon.tl import types
 from interaction_state import PersistentInteractionState
 from message_schema import load_message_file
 from telegram_events import (
+    PHONE_CALL_SUBTYPES,
     missed_call_interaction,
     new_message_interaction,
+    phone_call_subtype,
     requested_call_interaction,
+    resolve_reply_peer,
 )
 from telegram_dispatcher import (
     TelegramInteractionDispatcher,
@@ -198,7 +203,11 @@ interaction_health = {
     "connection": "starting",
     "raw_phone_revision": None,
     "phone_subtype": "never",
+    "phone_revisions": {subtype: None for subtype in PHONE_CALL_SUBTYPES},
     "service_call_revision": None,
+    "service_call_status": "never",
+    "service_peer_source": "never",
+    "missed_call_poll": "starting",
     "classified_revision": None,
     "last_kind": "never",
     "last_response": "never",
@@ -432,24 +441,24 @@ async def handle_message(event) -> None:
 @client.on(events.Raw(types.UpdatePhoneCall))
 async def handle_phone_call(update) -> None:
     """Cuenta solicitudes de llamadas reales, no notas de voz."""
-    phone_call = getattr(update, "phone_call", None)
-    subtype = (
-        "requested" if isinstance(phone_call, types.PhoneCallRequested)
-        else "waiting" if isinstance(phone_call, types.PhoneCallWaiting)
-        else "other"
-    )
+    subtype = phone_call_subtype(update)
+    revision = str(uuid.uuid4())
+    revisions = dict(interaction_health["phone_revisions"])
+    revisions[subtype] = revision
     update_interaction_health(
-        raw_phone_revision=str(uuid.uuid4()),
+        raw_phone_revision=revision,
         phone_subtype=subtype,
+        phone_revisions=revisions,
     )
     interaction = requested_call_interaction(update, self_user_id=self_user_id)
     if not interaction:
         return
-    try:
-        reply_peer = await client.get_input_entity(interaction.contact_id)
-    except Exception as exc:
-        logging.warning("Telegram call peer pre-resolution failed (%s)", type(exc).__name__)
-        reply_peer = interaction.contact_id
+    reply_peer, peer_source = await resolve_reply_peer(
+        client,
+        update,
+        contact_id=interaction.contact_id,
+    )
+    update_interaction_health(service_peer_source=peer_source)
     await process_interaction(
         chat_id=interaction.contact_id,
         event_id=interaction.event_id,
@@ -465,21 +474,75 @@ async def handle_missed_call_service(update) -> None:
     if isinstance(message, types.MessageService) and isinstance(
         getattr(message, "action", None), types.MessageActionPhoneCall
     ):
-        update_interaction_health(service_call_revision=str(uuid.uuid4()))
+        update_interaction_health(
+            service_call_revision=str(uuid.uuid4()),
+            service_call_status="seen",
+        )
     interaction = missed_call_interaction(update, self_user_id=self_user_id)
     if not interaction:
+        if isinstance(message, types.MessageService) and isinstance(
+            getattr(message, "action", None), types.MessageActionPhoneCall
+        ):
+            update_interaction_health(service_call_status="ignored")
         return
-    try:
-        reply_peer = await client.get_input_entity(interaction.contact_id)
-    except Exception as exc:
-        logging.warning("Telegram service-call peer pre-resolution failed (%s)", type(exc).__name__)
-        reply_peer = interaction.contact_id
-    await process_interaction(
-        chat_id=interaction.contact_id,
-        event_id=interaction.event_id,
-        kind=interaction.kind,
-        reply_peer=reply_peer,
+    reply_peer, peer_source = await resolve_reply_peer(
+        client,
+        update,
+        contact_id=interaction.contact_id,
     )
+    update_interaction_health(
+        service_call_status="classified",
+        service_peer_source=peer_source,
+    )
+    try:
+        await process_interaction(
+            chat_id=interaction.contact_id,
+            event_id=interaction.event_id,
+            kind=interaction.kind,
+            reply_peer=reply_peer,
+        )
+    except Exception:
+        update_interaction_health(service_call_status="delivery_failed")
+        raise
+    update_interaction_health(service_call_status="processed")
+
+
+async def poll_recent_missed_calls() -> None:
+    """Fallback for missed calls whose real-time service update was incomplete."""
+
+    not_before = datetime.now(timezone.utc) - timedelta(seconds=45)
+    while True:
+        try:
+            messages = [
+                message
+                async for message in client.iter_messages(
+                    None,
+                    limit=30,
+                    filter=types.InputMessagesFilterPhoneCalls(missed=True),
+                    wait_time=0,
+                )
+            ]
+            update_interaction_health(missed_call_poll="healthy")
+            for message in reversed(messages):
+                message_date = getattr(message, "date", None)
+                if message_date is None:
+                    continue
+                if message_date.tzinfo is None:
+                    message_date = message_date.replace(tzinfo=timezone.utc)
+                if message_date < not_before:
+                    continue
+                await handle_missed_call_service(
+                    SimpleNamespace(message=message, _entities={})
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            update_interaction_health(missed_call_poll="failed")
+            logging.warning(
+                "Telegram missed-call fallback failed (%s)",
+                type(exc).__name__,
+            )
+        await asyncio.sleep(12)
 
 
 async def main() -> None:
@@ -506,13 +569,15 @@ async def main() -> None:
     await client.catch_up()
     write_health(True)
     heartbeat_task = asyncio.create_task(heartbeat())
+    missed_call_task = asyncio.create_task(poll_recent_missed_calls())
     try:
         await client.run_until_disconnected()
     finally:
         update_interaction_health(connection="closed")
         heartbeat_task.cancel()
+        missed_call_task.cancel()
         try:
-            await heartbeat_task
+            await asyncio.gather(heartbeat_task, missed_call_task)
         except asyncio.CancelledError:
             pass
         try:

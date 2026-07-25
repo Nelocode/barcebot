@@ -348,7 +348,15 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
                 "worker_revision": "00000000-0000-4000-8000-000000000001",
                 "connection": "open",
                 "raw_phone_revision": "00000000-0000-4000-8000-000000000002",
-                "phone_subtype": "requested",
+                "phone_subtype": "discarded",
+                "phone_revisions": {
+                    "requested": "00000000-0000-4000-8000-000000000004",
+                    "discarded": "00000000-0000-4000-8000-000000000005",
+                    "caller": secret_id,
+                },
+                "service_call_status": "processed",
+                "service_peer_source": "update_entities",
+                "missed_call_poll": "healthy",
                 "classified_revision": "00000000-0000-4000-8000-000000000003",
                 "last_kind": "call",
                 "last_response": "call",
@@ -370,8 +378,21 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
         body = response.get_data(as_text=True)
         self.assertNotIn(secret_id, body)
         self.assertNotIn("private content", body)
-        self.assertEqual("requested", response.get_json()["phone_subtype"])
-        self.assertEqual("sent", response.get_json()["delivery"]["audio"])
+        data = response.get_json()
+        self.assertEqual("discarded", data["phone_subtype"])
+        self.assertEqual(
+            "00000000-0000-4000-8000-000000000004",
+            data["phone_revisions"]["requested"],
+        )
+        self.assertEqual(
+            "00000000-0000-4000-8000-000000000005",
+            data["phone_revisions"]["discarded"],
+        )
+        self.assertNotIn("caller", data["phone_revisions"])
+        self.assertEqual("processed", data["service_call_status"])
+        self.assertEqual("update_entities", data["service_peer_source"])
+        self.assertEqual("healthy", data["missed_call_poll"])
+        self.assertEqual("sent", data["delivery"]["audio"])
 
 
 if __name__ == "__main__":
