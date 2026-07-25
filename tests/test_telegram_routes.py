@@ -237,6 +237,25 @@ class TelegramRoutesTestCase(unittest.TestCase):
             self.assertTrue(browser_session.get("telegram_admin"))
             self.assertTrue(browser_session.permanent)
 
+    def test_admin_recovery_does_not_restart_an_online_telegram_worker(self):
+        payload = {
+            "api_id": self.API_ID,
+            "api_hash": self.API_HASH,
+            "phone": self.PHONE,
+        }
+        with (
+            patch.object(app_module, "_telegram_session_is_authorized", return_value=True),
+            patch.object(app_module, "_telegram_credentials_match_saved", return_value=True),
+            patch.object(app_module, "bot_is_running", return_value=True),
+            patch.object(app_module, "restart_telegram_worker") as restart,
+        ):
+            response = self.client.post("/api/link_telegram", json=payload)
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(response.get_json()["ok"])
+        self.assertIn("sigue en línea", response.get_json()["message"])
+        restart.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

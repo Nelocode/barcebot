@@ -4,15 +4,63 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+import hashlib
+
+from telethon.tl import functions
 
 from interaction_state import InteractionDecision, PersistentInteractionState
+
+
+def interaction_delivery_fingerprint(chat_id: int, event_id: str) -> str:
+    """Return an opaque, stable delivery key without exposing Telegram IDs."""
+
+    material = f"telegram-delivery-v1\0{chat_id}\0{event_id}".encode(
+        "utf-8",
+        errors="strict",
+    )
+    return hashlib.sha256(material).hexdigest()
+
+
+def telegram_delivery_random_id(interaction_fingerprint: str, component: str) -> int:
+    """Derive Telegram's signed 64-bit idempotency ID for one component."""
+
+    material = (
+        f"telegram-random-id-v1\0{interaction_fingerprint}\0{component}"
+    ).encode("utf-8", errors="strict")
+    value = int.from_bytes(hashlib.sha256(material).digest()[:8], "big", signed=True)
+    return value or 1
+
+
+def build_telegram_text_request(
+    peer: object,
+    message: str,
+    interaction_fingerprint: str,
+):
+    return functions.messages.SendMessageRequest(
+        peer=peer,
+        message=message,
+        random_id=telegram_delivery_random_id(interaction_fingerprint, "text"),
+    )
+
+
+def build_telegram_media_request(
+    peer: object,
+    media: object,
+    interaction_fingerprint: str,
+):
+    return functions.messages.SendMediaRequest(
+        peer=peer,
+        media=media,
+        message="",
+        random_id=telegram_delivery_random_id(interaction_fingerprint, "audio"),
+    )
 
 
 class TelegramInteractionDispatcher:
     def __init__(
         self,
         state: PersistentInteractionState,
-        send_response: Callable[[int, str, str], Awaitable[None]],
+        send_response: Callable[[object, str, str, str], Awaitable[None]],
     ) -> None:
         self.state = state
         self.send_response = send_response
@@ -25,19 +73,28 @@ class TelegramInteractionDispatcher:
         event_id: str,
         kind: str,
         detected_language: str | None = None,
+        reply_peer: object | None = None,
     ) -> InteractionDecision:
         lock = self._locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
-            decision = self.state.register(
+            decision = self.state.preview(
                 contact_id=chat_id,
                 event_id=event_id,
                 kind=kind,
                 detected_language=detected_language,
             )
             if not decision.duplicate and decision.response_key:
+                delivery_fingerprint = interaction_delivery_fingerprint(chat_id, event_id)
                 await self.send_response(
-                    chat_id,
+                    reply_peer if reply_peer is not None else chat_id,
                     decision.response_key,
                     decision.language,
+                    delivery_fingerprint,
+                )
+                return self.state.register(
+                    contact_id=chat_id,
+                    event_id=event_id,
+                    kind=kind,
+                    detected_language=detected_language,
                 )
             return decision

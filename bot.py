@@ -6,8 +6,8 @@ Reglas de conversación:
 * texto o multimedia posterior: Paso 2, sin límite;
 * cualquier interacción posterior, incluida una llamada, recibe Paso 2.
 
-El estado se persiste y los eventos se reclaman antes de enviar para evitar
-respuestas dobles durante reconexiones o despliegues.
+Cada componente de salida usa un identificador MTProto estable y el evento se
+confirma después de la entrega, evitando duplicados sin perder reintentos.
 """
 
 import asyncio
@@ -17,8 +17,9 @@ import os
 from pathlib import Path
 import re
 import time
+import uuid
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.tl import types
 
 from interaction_state import PersistentInteractionState
@@ -28,7 +29,11 @@ from telegram_events import (
     new_message_interaction,
     requested_call_interaction,
 )
-from telegram_dispatcher import TelegramInteractionDispatcher
+from telegram_dispatcher import (
+    TelegramInteractionDispatcher,
+    build_telegram_media_request,
+    build_telegram_text_request,
+)
 
 
 BASE_DIR = Path(__file__).parent
@@ -38,9 +43,12 @@ MESSAGES_FILE = DATA_DIR / "messages.json"
 DEFAULT_MESSAGES_FILE = BASE_DIR / "messages.json"
 SESSION_FILE = str(DATA_DIR / "tg_session")
 HEALTH_FILE = DATA_DIR / "tg_userbot_health.json"
+IDENTITY_FILE = DATA_DIR / "tg_identity.json"
 AUTHORIZED_MARKER_FILE = DATA_DIR / "tg_session_authorized.json"
 INTERACTION_STATE_FILE = DATA_DIR / "tg_interaction_state.json"
+INTERACTION_HEALTH_FILE = DATA_DIR / "tg_interaction_health.json"
 TELEGRAM_SEND_TIMEOUT_SECONDS = 20
+TELEGRAM_SEND_RETRIES = 3
 
 
 def _load_env_file() -> None:
@@ -184,6 +192,44 @@ def get_response_message(language: str, response_key: str) -> tuple[str, str]:
 
 client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 self_user_id: int | None = None
+interaction_health = {
+    "schema_version": 1,
+    "worker_revision": str(uuid.uuid4()),
+    "connection": "starting",
+    "raw_phone_revision": None,
+    "phone_subtype": "never",
+    "service_call_revision": None,
+    "classified_revision": None,
+    "last_kind": "never",
+    "last_response": "never",
+    "delivery": {
+        "peer_resolution": "never",
+        "text": "never",
+        "audio": "never",
+    },
+}
+
+
+def update_interaction_health(**changes) -> None:
+    """Persiste únicamente señales operativas sin IDs ni contenido del cliente."""
+
+    interaction_health.update(changes)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temporary_file = INTERACTION_HEALTH_FILE.with_suffix(".tmp")
+        temporary_file.write_text(
+            json.dumps(interaction_health, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary_file, INTERACTION_HEALTH_FILE)
+    except OSError:
+        logging.warning("Telegram interaction health could not be persisted")
+
+
+def update_delivery_health(stage: str, state: str) -> None:
+    delivery = dict(interaction_health["delivery"])
+    delivery[stage] = state
+    update_interaction_health(delivery=delivery)
 
 
 def write_health(ready: bool) -> None:
@@ -195,6 +241,7 @@ def write_health(ready: bool) -> None:
         encoding="utf-8",
     )
     os.replace(temporary_file, HEALTH_FILE)
+    update_interaction_health(connection="open" if ready else "closed")
 
 
 def write_authorized_marker() -> None:
@@ -206,37 +253,119 @@ def write_authorized_marker() -> None:
     os.replace(temporary_file, AUTHORIZED_MARKER_FILE)
 
 
+def write_identity(user) -> None:
+    """Publica sólo una identidad mostrable; nunca teléfono ni credenciales."""
+
+    display_name = " ".join(
+        part for part in (getattr(user, "first_name", ""), getattr(user, "last_name", ""))
+        if isinstance(part, str) and part.strip()
+    ).strip()
+    username = getattr(user, "username", None)
+    payload = {
+        "display_name": display_name[:120] or "Cuenta de Telegram",
+        "username": username[:64] if isinstance(username, str) and username else None,
+        "updated_at": time.time(),
+    }
+    temporary_file = IDENTITY_FILE.with_suffix(".tmp")
+    temporary_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary_file, IDENTITY_FILE)
+
+
 async def heartbeat() -> None:
     while True:
-        write_health(True)
+        write_health(client.is_connected())
         await asyncio.sleep(15)
 
 
-async def send_response(chat_id: int, response_key: str, language: str) -> None:
-    load_messages_fresh()
-    message_text, audio_file = get_response_message(language, response_key)
-
-    if message_text:
+async def _retry_telegram_operation(label: str, operation):
+    last_error = None
+    for attempt in range(1, TELEGRAM_SEND_RETRIES + 1):
         try:
-            await asyncio.wait_for(
-                client.send_message(chat_id, message_text),
+            result = await asyncio.wait_for(
+                operation(),
                 timeout=TELEGRAM_SEND_TIMEOUT_SECONDS,
             )
-        except Exception:
-            logging.exception("Telegram text delivery failed")
+            update_delivery_health(label.replace("_delivery", ""), "sent")
+            return result
+        except Exception as exc:
+            last_error = exc
+            update_delivery_health(label.replace("_delivery", ""), "failed")
+            logging.warning(
+                "Telegram %s attempt %s/%s failed (%s)",
+                label,
+                attempt,
+                TELEGRAM_SEND_RETRIES,
+                type(exc).__name__,
+            )
+            if attempt < TELEGRAM_SEND_RETRIES:
+                await asyncio.sleep(attempt)
+    raise RuntimeError(f"telegram_{label}_failed") from last_error
+
+
+async def send_response(
+    delivery_peer: object,
+    response_key: str,
+    language: str,
+    delivery_fingerprint: str,
+) -> None:
+    load_messages_fresh()
+    message_text, audio_file = get_response_message(language, response_key)
+    update_interaction_health(
+        last_response=response_key,
+        delivery={
+            "peer_resolution": "pending",
+            "text": "pending" if message_text else "skipped",
+            "audio": "pending" if audio_file else "skipped",
+        },
+    )
+    resolved_peer = await _retry_telegram_operation(
+        "peer_resolution",
+        lambda: client.get_input_entity(delivery_peer),
+    )
+
+    if message_text:
+        await _retry_telegram_operation(
+            "text_delivery",
+            lambda: client(
+                build_telegram_text_request(
+                    resolved_peer,
+                    message_text,
+                    delivery_fingerprint,
+                )
+            ),
+        )
 
     if audio_file:
         audio_path = AUDIO_DIR / audio_file
-        if audio_path.exists():
-            try:
-                await asyncio.wait_for(
-                    client.send_file(chat_id, str(audio_path), voice_note=False),
-                    timeout=TELEGRAM_SEND_TIMEOUT_SECONDS,
+        if not audio_path.exists():
+            update_delivery_health("audio", "missing")
+            raise FileNotFoundError(f"Configured Telegram audio is missing: {audio_file}")
+        audio_attributes, audio_mime_type = utils.get_attributes(
+            str(audio_path),
+            force_document=False,
+            voice_note=False,
+        )
+
+        async def send_audio_media():
+            uploaded_file = await client.upload_file(str(audio_path))
+            media = types.InputMediaUploadedDocument(
+                file=uploaded_file,
+                mime_type=audio_mime_type,
+                attributes=audio_attributes,
+                force_file=False,
+            )
+            return await client(
+                build_telegram_media_request(
+                    resolved_peer,
+                    media,
+                    delivery_fingerprint,
                 )
-            except Exception:
-                logging.exception("Telegram audio delivery failed")
-        else:
-            logging.error("Telegram audio file is missing: %s", audio_file)
+            )
+
+        await _retry_telegram_operation(
+            "audio_delivery",
+            send_audio_media,
+        )
 
 
 telegram_dispatcher = TelegramInteractionDispatcher(interaction_state, send_response)
@@ -248,12 +377,14 @@ async def process_interaction(
     event_id: str,
     kind: str,
     detected_language: str | None = None,
+    reply_peer: object | None = None,
 ) -> None:
     decision = await telegram_dispatcher.dispatch(
         chat_id=chat_id,
         event_id=event_id,
         kind=kind,
         detected_language=detected_language,
+        reply_peer=reply_peer,
     )
     if decision.duplicate:
         logging.info("Telegram duplicate interaction ignored")
@@ -267,15 +398,25 @@ async def process_interaction(
         decision.response_key,
         decision.language,
     )
+    update_interaction_health(
+        classified_revision=str(uuid.uuid4()),
+        last_kind=kind,
+        last_response=decision.response_key or "never",
+    )
 
 
 @client.on(events.NewMessage(incoming=True))
 async def handle_message(event) -> None:
     """Maneja una vez cada texto, voz, imagen, documento o multimedia."""
+    try:
+        reply_peer = await event.get_input_chat()
+    except (ValueError, TypeError):
+        reply_peer = event.chat_id
     interaction = new_message_interaction(
         event.message,
         chat_id=event.chat_id,
         is_private=event.is_private,
+        reply_peer=reply_peer,
     )
     if not interaction:
         return
@@ -284,32 +425,60 @@ async def handle_message(event) -> None:
         event_id=interaction.event_id,
         kind=interaction.kind,
         detected_language=detect_lang(interaction.text) if interaction.text else None,
+        reply_peer=interaction.reply_peer,
     )
 
 
 @client.on(events.Raw(types.UpdatePhoneCall))
 async def handle_phone_call(update) -> None:
     """Cuenta solicitudes de llamadas reales, no notas de voz."""
+    phone_call = getattr(update, "phone_call", None)
+    subtype = (
+        "requested" if isinstance(phone_call, types.PhoneCallRequested)
+        else "waiting" if isinstance(phone_call, types.PhoneCallWaiting)
+        else "other"
+    )
+    update_interaction_health(
+        raw_phone_revision=str(uuid.uuid4()),
+        phone_subtype=subtype,
+    )
     interaction = requested_call_interaction(update, self_user_id=self_user_id)
     if not interaction:
         return
+    try:
+        reply_peer = await client.get_input_entity(interaction.contact_id)
+    except Exception as exc:
+        logging.warning("Telegram call peer pre-resolution failed (%s)", type(exc).__name__)
+        reply_peer = interaction.contact_id
     await process_interaction(
         chat_id=interaction.contact_id,
         event_id=interaction.event_id,
         kind=interaction.kind,
+        reply_peer=reply_peer,
     )
 
 
 @client.on(events.Raw(types.UpdateNewMessage))
 async def handle_missed_call_service(update) -> None:
     """Fallback para una llamada perdida recibida después de reconectar."""
+    message = getattr(update, "message", None)
+    if isinstance(message, types.MessageService) and isinstance(
+        getattr(message, "action", None), types.MessageActionPhoneCall
+    ):
+        update_interaction_health(service_call_revision=str(uuid.uuid4()))
     interaction = missed_call_interaction(update, self_user_id=self_user_id)
     if not interaction:
         return
+    try:
+        reply_peer = await client.get_input_entity(interaction.contact_id)
+    except Exception as exc:
+        logging.warning("Telegram service-call peer pre-resolution failed (%s)", type(exc).__name__)
+        reply_peer = interaction.contact_id
     await process_interaction(
         chat_id=interaction.contact_id,
         event_id=interaction.event_id,
         kind=interaction.kind,
+        reply_peer=reply_peer,
     )
 
 
@@ -321,6 +490,7 @@ async def main() -> None:
     )
 
     logging.info("Starting Telegram User Bot...")
+    update_interaction_health(connection="connecting")
     await client.connect()
     if not await client.is_user_authorized():
         AUTHORIZED_MARKER_FILE.unlink(missing_ok=True)
@@ -331,12 +501,15 @@ async def main() -> None:
     me = await client.get_me()
     self_user_id = me.id
     write_authorized_marker()
+    write_identity(me)
     logging.info("Telegram session authorized; user bot ready.")
+    await client.catch_up()
     write_health(True)
     heartbeat_task = asyncio.create_task(heartbeat())
     try:
         await client.run_until_disconnected()
     finally:
+        update_interaction_health(connection="closed")
         heartbeat_task.cancel()
         try:
             await heartbeat_task

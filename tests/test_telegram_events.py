@@ -78,6 +78,31 @@ class TelegramEventExtractionTests(unittest.TestCase):
         self.assertIsNone(requested_call_interaction(outgoing, self_user_id=999))
         self.assertIsNone(requested_call_interaction(incoming, self_user_id=555))
 
+    def test_incoming_waiting_call_and_reply_peer_are_supported(self):
+        protocol = types.PhoneCallProtocol(
+            min_layer=65,
+            max_layer=92,
+            library_versions=["test"],
+        )
+        update = types.UpdatePhoneCall(types.PhoneCallWaiting(
+            id=701,
+            access_hash=2,
+            date=None,
+            admin_id=123,
+            participant_id=999,
+            protocol=protocol,
+        ))
+        peer = types.InputPeerUser(123, 456)
+
+        result = requested_call_interaction(
+            update,
+            self_user_id=999,
+            reply_peer=peer,
+        )
+
+        self.assertEqual("call:701", result.event_id)
+        self.assertIs(peer, result.reply_peer)
+
     def test_missed_call_service_uses_same_call_event_id_for_dedupe(self):
         service = types.MessageService(
             id=80,

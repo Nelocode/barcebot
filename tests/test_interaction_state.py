@@ -7,6 +7,26 @@ from interaction_state import PersistentInteractionState
 
 
 class PersistentInteractionStateTests(unittest.TestCase):
+    def test_preview_does_not_consume_interaction_before_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state = PersistentInteractionState(state_path)
+
+            preview = state.preview(
+                contact_id="customer",
+                event_id="call:1",
+                kind="call",
+            )
+
+            self.assertEqual("call", preview.response_key)
+            self.assertFalse(state_path.exists())
+            committed = state.register(
+                contact_id="customer",
+                event_id="call:1",
+                kind="call",
+            )
+            self.assertEqual("call", committed.response_key)
+
     def make_store(self, directory: str, **kwargs) -> PersistentInteractionState:
         return PersistentInteractionState(Path(directory) / "state.json", **kwargs)
 

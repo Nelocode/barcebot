@@ -3,6 +3,9 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 
 const CONNECTION_STATES = new Set(['starting', 'connecting', 'open', 'closed', 'unknown']);
+const DISCONNECT_REASONS = new Set([
+  'never', 'transient', 'logged_out', 'session_invalid', 'timeout', 'shutdown', 'unknown',
+]);
 const EVENT_STATES = new Set([
   'offer', 'ringing', 'preaccept', 'transport', 'relaylatency', 'terminate',
   'timeout', 'reject', 'accept', 'other', 'missing', 'never',
@@ -46,6 +49,8 @@ function initialState(idFactory) {
     schema_version: 1,
     worker_revision: idFactory(),
     connection: 'starting',
+    disconnect_reason: 'never',
+    reauth_required: false,
     listener: 'pending',
     raw_listener: 'pending',
     raw_call_revision: null,
@@ -117,6 +122,13 @@ export function createWhatsAppCallHealth({
       switch (metric.type) {
         case 'connection':
           state.connection = allowed(metric.state, CONNECTION_STATES, 'unknown');
+          if (state.connection === 'open' || state.connection === 'connecting') {
+            state.disconnect_reason = 'never';
+            state.reauth_required = false;
+          } else if (state.connection === 'closed') {
+            state.disconnect_reason = allowed(metric.reason, DISCONNECT_REASONS, 'unknown');
+            state.reauth_required = metric.reauthRequired === true;
+          }
           break;
         case 'listener_registered':
           state.listener = 'registered';

@@ -93,6 +93,39 @@ test('normaliza valores desconocidos a enums seguros', () => {
   fs.rmSync(directory, { recursive: true, force: true });
 });
 
+test('distingue cierre transitorio de una sesión que exige nuevo QR', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-health-'));
+  const filePath = path.join(directory, 'health.json');
+  const health = createWhatsAppCallHealth({
+    filePath,
+    idFactory: idFactory(),
+    logger: { warn() {} },
+  });
+
+  health.record({
+    type: 'connection',
+    state: 'closed',
+    reason: 'logged_out',
+    reauthRequired: true,
+  });
+
+  assert.equal(health.snapshot().disconnect_reason, 'logged_out');
+  assert.equal(health.snapshot().reauth_required, true);
+  health.record({ type: 'connection', state: 'open' });
+  assert.equal(health.snapshot().disconnect_reason, 'never');
+  assert.equal(health.snapshot().reauth_required, false);
+  health.record({
+    type: 'connection',
+    state: 'closed',
+    reason: 'session_invalid',
+    reauthRequired: true,
+  });
+  assert.equal(health.snapshot().disconnect_reason, 'session_invalid');
+  assert.equal(health.snapshot().reauth_required, true);
+
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
 test('conserva el resultado de la oferta aunque llegue terminate despues', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-health-'));
   const filePath = path.join(directory, 'health.json');

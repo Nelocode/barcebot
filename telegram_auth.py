@@ -183,8 +183,42 @@ class TelegramAuthManager:
 
     async def _clear_pending(self) -> None:
         pending, self._pending = self._pending, None
+        expiry_handle = pending.get("expiry_handle") if pending else None
+        if expiry_handle is not None:
+            expiry_handle.cancel()
         if pending and pending.get("client") is not None:
             await self._disconnect(pending["client"])
+
+    async def _expire_pending(self, attempt_token: str) -> None:
+        """Cierra de forma autónoma un reto abandonado al vencer su TTL."""
+
+        pending = self._pending
+        if not pending:
+            return
+        expected = pending.get("attempt_token") or ""
+        if not expected or not secrets.compare_digest(expected, attempt_token):
+            return
+        if time.monotonic() >= pending["expires_at"]:
+            await self._clear_pending()
+
+    def _arm_expiry(self, pending: dict[str, Any], expires_in: float) -> None:
+        previous = pending.get("expiry_handle")
+        if previous is not None:
+            previous.cancel()
+        token = pending["attempt_token"]
+        pending["expiry_handle"] = asyncio.get_running_loop().call_later(
+            expires_in,
+            lambda: asyncio.create_task(self._expire_pending(token)),
+        )
+
+    def has_pending(self) -> bool:
+        """Indica si existe un reto vigente sin exponer sus datos internos."""
+
+        outcome = self._submit(self._pending_status())
+        return bool(outcome.public.get("pending"))
+
+    async def _pending_status(self) -> AuthOutcome:
+        return AuthOutcome({"ok": True, "pending": bool(await self._get_pending())})
 
     async def _get_pending(
         self,
@@ -274,6 +308,10 @@ class TelegramAuthManager:
                         ),
                         "resend_at": time.monotonic() + max(30, delivery["timeout_seconds"]),
                     })
+                    self._arm_expiry(
+                        existing,
+                        max(self.pending_ttl, delivery["timeout_seconds"] + 120),
+                    )
                     return AuthOutcome({"ok": True, "needs_code": True, "resent": True, **delivery})
                 except asyncio.CancelledError:
                     await self._clear_pending()
@@ -324,6 +362,7 @@ class TelegramAuthManager:
                 "delivery": delivery,
                 "attempt_token": secrets.token_urlsafe(32),
             }
+            self._arm_expiry(self._pending, expires_in)
             return AuthOutcome(
                 {"ok": True, "needs_code": True, **delivery},
                 attempt_token=self._pending["attempt_token"],

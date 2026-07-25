@@ -185,3 +185,49 @@ class PersistentInteractionState:
             language=effective_language,
             persisted=persisted,
         )
+
+    def preview(
+        self,
+        *,
+        contact_id: object,
+        event_id: object,
+        kind: str,
+        detected_language: str | None = None,
+    ) -> InteractionDecision:
+        """Calcula la respuesta sin consumir la interacción todavía.
+
+        El dispatcher la confirma con ``register`` sólo después de completar
+        la entrega, de modo que un fallo de Telegram pueda reintentarse.
+        """
+
+        if contact_id in (None, ""):
+            raise ValueError("contact_id is required")
+        if event_id in (None, ""):
+            raise ValueError("event_id is required")
+        if kind not in VALID_KINDS:
+            raise ValueError("kind must be call or content")
+        if detected_language not in VALID_LANGUAGES:
+            detected_language = None
+
+        contact_key = self._fingerprint("contact", contact_id)
+        event_key = self._fingerprint("event", event_id)
+        state = self._contacts.get(contact_key)
+        phase = state["phase"] if state else 0
+        language = state.get("language") if state else None
+        recent_events = state.get("recent_events", []) if state else []
+        if event_key in recent_events:
+            return InteractionDecision(
+                duplicate=True,
+                phase=phase,
+                response_key=None,
+                language=language or self.default_language,
+            )
+
+        effective_language = language or detected_language or self.default_language
+        response_key = ("call" if kind == "call" else "step1") if phase == 0 else "step2"
+        return InteractionDecision(
+            duplicate=False,
+            phase=1 if phase == 0 else 2,
+            response_key=response_key,
+            language=effective_language,
+        )

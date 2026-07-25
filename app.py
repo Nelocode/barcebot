@@ -4,6 +4,7 @@ Flask webapp para gestionar mensajes y audios del bot.
 """
 import os
 import json
+import hashlib
 import shutil
 import re
 import secrets
@@ -11,6 +12,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -24,6 +26,20 @@ AUDIO_DIR = DATA_DIR / "audios"
 MESSAGES_FILE = DATA_DIR / "messages.json"
 DEFAULT_MESSAGES_FILE = BASE_DIR / "messages.json"
 WA_CALL_HEALTH_FILE = DATA_DIR / "wa_call_health.json"
+TG_SESSION_BASE = DATA_DIR / "tg_session"
+TG_SWITCH_SESSION_BASE = DATA_DIR / "tg_switch_session"
+TG_SWITCH_ROLLBACK_DIR = DATA_DIR / ".tg_switch_rollback"
+WA_AUTH_DIR = DATA_DIR / "wa_auth"
+WA_IDENTITY_FILE = DATA_DIR / "wa_identity.json"
+WA_SWITCH_DIR = DATA_DIR / "wa_switch"
+WA_SWITCH_AUTH_DIR = WA_SWITCH_DIR / "candidate_auth"
+WA_SWITCH_QR_FILE = WA_SWITCH_DIR / "qr.png"
+WA_SWITCH_HEALTH_FILE = WA_SWITCH_DIR / "health.json"
+WA_SWITCH_IDENTITY_FILE = WA_SWITCH_DIR / "identity.json"
+WA_SWITCH_PID_FILE = WA_SWITCH_DIR / "worker.pid"
+WA_SWITCH_OPERATION_FILE = WA_SWITCH_DIR / "operation.json"
+WA_SWITCH_RECOVERY_ROOT = DATA_DIR / ".wa_switch_recovery"
+WA_SWITCH_TIMEOUT_SECONDS = 180
 
 def _load_or_create_flask_secret() -> str:
     configured = os.environ.get("FLASK_SECRET")
@@ -60,7 +76,12 @@ app.permanent_session_lifetime = timedelta(days=365)
 
 # ── Telethon auth state (para flujo interactivo desde el panel) ──────
 # Conserva un solo event loop entre send_code_request, sign_in y 2FA.
-_telegram_auth = TelegramAuthManager(str(DATA_DIR / "tg_session"))
+_telegram_auth = TelegramAuthManager(str(TG_SESSION_BASE))
+_telegram_switch_auth = TelegramAuthManager(str(TG_SWITCH_SESSION_BASE))
+_telegram_switch_lock = threading.RLock()
+_wa_process_lock = threading.RLock()
+_wa_switch_lock = threading.RLock()
+_wa_switch_expiry_timer: threading.Timer | None = None
 
 # ── HTML Template (todo en uno para portabilidad) ───────────────────
 TEMPLATE = r"""<!DOCTYPE html>
@@ -123,8 +144,8 @@ label { color: #c8c8e0 !important; font-weight: 500; }
         <span id="wa-status" class="badge bg-secondary" style="font-size:0.75rem;">💬 WA: Verificando...</span>
       </div>
       <button class="btn btn-sm btn-outline-light" onclick="showSetup()">⚙️ Configurar</button>
-      <button class="btn btn-sm btn-outline-light" onclick="restartBot()">🔄 Reiniciar TG</button>
-      <button class="btn btn-sm btn-outline-light" onclick="restartWaBot()">🔄 Reiniciar WA</button>
+      <button class="btn btn-sm btn-outline-light" onclick="restartBot()">🔄 Reiniciar servicio TG</button>
+      <button class="btn btn-sm btn-outline-light" onclick="restartWaBot()">🔄 Reiniciar servicio WA</button>
     </div>
   </div>
 
@@ -147,19 +168,33 @@ label { color: #c8c8e0 !important; font-weight: 500; }
           <li>Copia el <strong>api_id</strong> y <strong>api_hash</strong> de abajo</li>
         </ol>
       </details>
-      <div class="row mb-2">
-        <div class="col-3">
-          <input id="tg-api-id" type="number" class="form-control form-control-sm" placeholder="api_id" style="font-family:monospace;font-size:0.8rem;">
+      <div id="tg-initial-link">
+        <div class="row mb-2">
+          <div class="col-3">
+            <input id="tg-api-id" type="number" class="form-control form-control-sm" placeholder="api_id" style="font-family:monospace;font-size:0.8rem;">
+          </div>
+          <div class="col-5">
+            <input id="tg-api-hash" type="password" autocomplete="new-password" class="form-control form-control-sm" placeholder="api_hash" style="font-family:monospace;font-size:0.8rem;">
+          </div>
+          <div class="col-4">
+            <input id="tg-phone" type="text" class="form-control form-control-sm" placeholder="+57 300 123 4567" style="font-family:monospace;font-size:0.8rem;">
+          </div>
         </div>
-        <div class="col-5">
-          <input id="tg-api-hash" type="password" autocomplete="new-password" class="form-control form-control-sm" placeholder="api_hash" style="font-family:monospace;font-size:0.8rem;">
-        </div>
-        <div class="col-4">
-          <input id="tg-phone" type="text" class="form-control form-control-sm" placeholder="+57 300 123 4567" style="font-family:monospace;font-size:0.8rem;">
+        <div class="d-flex align-items-center gap-2 mb-2">
+          <button id="tg-link-btn" class="btn btn-sm btn-primary" onclick="linkTelegram()">🔗 Vincular</button>
         </div>
       </div>
-      <div class="d-flex align-items-center gap-2 mb-2">
-        <button id="tg-link-btn" class="btn btn-sm btn-primary" onclick="linkTelegram()">🔗 Vincular</button>
+      <div id="tg-linked-actions" style="display:none;" class="p-2 mb-2 rounded" >
+        <div id="tg-account-summary" class="small mb-2"></div>
+        <button id="tg-switch-open-btn" class="btn btn-sm btn-primary" onclick="showTelegramSwitch()">🔁 Cambiar cuenta</button>
+      </div>
+      <div id="tg-switch-section" style="display:none;" class="p-2 mb-2 rounded">
+        <p class="small text-muted mb-2">La cuenta actual seguirá atendiendo hasta verificar la nueva. Reutilizaremos el api_id y api_hash guardados.</p>
+        <div class="d-flex gap-2">
+          <input id="tg-switch-phone" type="text" class="form-control form-control-sm" placeholder="Nuevo teléfono, por ejemplo +34..." style="font-family:monospace;">
+          <button id="tg-switch-btn" class="btn btn-sm btn-success" onclick="startTelegramSwitch()">📨 Enviar código</button>
+          <button class="btn btn-sm btn-outline-light" onclick="hideTelegramSwitch()">Cancelar</button>
+        </div>
       </div>
       <div id="tg-link-status" class="small text-muted mb-3"></div>
 
@@ -208,18 +243,17 @@ label { color: #c8c8e0 !important; font-weight: 500; }
       <details class="mb-2">
         <summary class="text-muted small" style="cursor:pointer;">📖 ¿Cómo vincular WhatsApp?</summary>
         <ol class="small mt-2" style="padding-left:1.5rem;">
-          <li>Haz click en <strong>"📲 Vincular WhatsApp"</strong></li>
-          <li>Espera unos segundos a que aparezca el código QR</li>
+          <li>Haz click en <strong>"Vincular"</strong> o <strong>"Cambiar cuenta"</strong></li>
+          <li>El código QR aparecerá automáticamente</li>
           <li>Abre WhatsApp en tu teléfono</li>
           <li>Ve a <strong>3 puntos > Dispositivos vinculados > Vincular dispositivo</strong></li>
           <li>Escanea el QR que aparece en pantalla</li>
-          <li>Haz click en <strong>"✅ Ya escaneé"</strong> para confirmar</li>
+          <li>El panel confirmará automáticamente cuando la cuenta esté lista</li>
         </ol>
       </details>
+      <div id="wa-account-summary" class="small mb-2"></div>
       <div class="d-flex align-items-center gap-2">
-        <button class="btn btn-sm btn-primary" onclick="launchWaAndShowQr()">📲 Vincular WhatsApp</button>
-        <button class="btn btn-sm btn-outline-light" onclick="loadWaQr()">🔄 Mostrar QR</button>
-        <button class="btn btn-sm btn-outline-light" onclick="refreshWaStatus()">✅ Ya escaneé</button>
+        <button id="wa-switch-btn" class="btn btn-sm btn-primary" onclick="startWaSwitch()">📲 Vincular WhatsApp</button>
       </div>
       <div id="wa-link-status" class="small text-muted mt-2"></div>
 
@@ -245,15 +279,14 @@ label { color: #c8c8e0 !important; font-weight: 500; }
   <div id="wa-qr-card" class="card" style="display:none;">
     <div class="card-header d-flex justify-content-between align-items-center">
       <span>💬 Vincular WhatsApp</span>
-      <button class="btn btn-sm btn-outline-light" onclick="document.getElementById('wa-qr-card').style.display='none'">✕</button>
+      <button class="btn btn-sm btn-outline-light wa-switch-cancel" onclick="cancelWaSwitch()">✕</button>
     </div>
     <div class="card-body text-center py-4">
-      <p class="mb-3">Escanea este QR con WhatsApp para vincular el bot:</p>
+      <p id="wa-qr-help" class="mb-3">Preparando un QR seguro…</p>
       <img id="wa-qr-img" src="" alt="QR WhatsApp" style="width:300px;height:300px;border-radius:12px;background:#fff;padding:8px;" class="mb-3">
       <p class="text-muted small">WhatsApp > 3 puntos > Dispositivos vinculados</p>
       <div class="mt-2">
-        <button class="btn btn-sm btn-outline-light" onclick="loadWaQr()">🔄 Actualizar QR</button>
-        <button class="btn btn-sm btn-outline-light" onclick="refreshWaStatus()">✅ Ya escaneé</button>
+        <button class="btn btn-sm btn-outline-light wa-switch-cancel" onclick="cancelWaSwitch()">✕ Cancelar cambio</button>
       </div>
     </div>
   </div>
@@ -291,6 +324,14 @@ label { color: #c8c8e0 !important; font-weight: 500; }
 let currentLang = "es";
 const LANG_NAMES = {"es":"Español","en":"English","fr":"Français"};
 const LANG_CODES = {"es":"ES","en":"EN","fr":"FR"};
+let channelCsrf = null;
+let channelState = null;
+let tgAuthMode = sessionStorage.getItem("tg_auth_mode") || "link";
+let waSwitchPollTimer = null;
+let waSwitchPolling = false;
+let waCommitInFlight = false;
+let waSwitchGeneration = 0;
+let waSwitchPollAbortController = null;
 
 function toast(msg, type="success") {
   const c = document.getElementById("toast-container");
@@ -549,7 +590,20 @@ async function saveCallText(lang, text) {
 async function restartBot() {
   if (!confirm("¿Reiniciar el bot de Telegram? (toma efecto inmediato)")) return;
   toast("🔄 Reiniciando bot TG...", "success");
-  fetch("/api/restart_bot", { method: "POST" }).catch(() => {});
+  try {
+    const r = await fetch("/api/restart_bot", {
+      method: "POST",
+      headers: channelHeaders()
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) {
+      toast("❌ " + (d.error || "No fue posible reiniciar Telegram"), "error");
+      return;
+    }
+  } catch(e) {
+    toast("❌ Error: " + e.message, "error");
+    return;
+  }
   let attempts = 0;
   const check = setInterval(async () => {
     attempts++;
@@ -569,10 +623,22 @@ async function restartBot() {
 }
 
 async function restartWaBot() {
-  if (!confirm("¿Reiniciar WhatsApp desde cero? Se borrará la sesión actual y necesitarás escanear un QR nuevo.")) return;
-  toast("🔄 Reseteando sesión WA...", "success");
-  await fetch("/api/reset_wa", { method: "POST" });
-  fetch("/api/restart_wa_bot", { method: "POST" }).catch(() => {});
+  if (!confirm("¿Reiniciar el servicio de WhatsApp? La cuenta vinculada se conservará.")) return;
+  toast("🔄 Reiniciando servicio WA...", "success");
+  try {
+    const r = await fetch("/api/restart_wa_bot", {
+      method: "POST",
+      headers: channelHeaders()
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) {
+      toast("❌ " + (d.error || "No fue posible reiniciar WhatsApp"), "error");
+      return;
+    }
+  } catch(e) {
+    toast("❌ Error: " + e.message, "error");
+    return;
+  }
   let attempts = 0;
   const check = setInterval(async () => {
     attempts++;
@@ -581,13 +647,11 @@ async function restartWaBot() {
       const d = await r.json();
       if (d.wa_running) {
         clearInterval(check);
-        toast("✅ Bot WA reiniciado y online", "success");
+        toast("✅ WhatsApp reiniciado; la cuenta sigue vinculada", "success");
         updateWaStatus(true);
-        // Mostrar QR si está disponible
-        setTimeout(loadWaQr, 3000);
       } else if (attempts >= 6) {
         clearInterval(check);
-        toast("⚠️ Restart WA lanzado, verifica el QR si es primera vez", "error");
+        toast("⚠️ El servicio arrancó, pero todavía no confirma conexión", "error");
       }
     } catch { if (attempts >= 6) { clearInterval(check); } }
   }, 2000);
@@ -627,71 +691,122 @@ async function updateWaStatus(running) {
   if (running === true) {
     el.className = "badge bg-success";
     el.innerHTML = '💬 WA: <span class="status-dot status-online"></span> Online';
-    qrCard.style.display = 'none';
+    if (!waSwitchPolling) qrCard.style.display = 'none';
   } else if (running === false) {
     el.className = "badge bg-danger";
     el.innerHTML = '💬 WA: <span class="status-dot status-offline"></span> Offline';
-    qrCard.style.display = 'none';
+    if (!waSwitchPolling) qrCard.style.display = 'none';
   } else if (running === null) {
     el.className = "badge bg-warning text-dark";
     el.innerHTML = '💬 WA: <span class="status-dot" style="background:#f39c12;"></span> No vinculado';
-    // Mostrar QR si está disponible
-    loadWaQr();
   } else {
     el.className = "badge bg-secondary";
     el.innerHTML = '💬 WA: Incierto';
-    qrCard.style.display = 'none';
+    if (!waSwitchPolling) qrCard.style.display = 'none';
   }
 }
 
-async function loadWaQr() {
-  const qrCard = document.getElementById("wa-qr-card");
-  const qrImg = document.getElementById("wa-qr-img");
-  try {
-    const r = await fetch("/api/data");
-    const d = await r.json();
-    if (d.wa_qr) {
-      qrImg.src = "/api/wa_qr?" + Date.now(); // timestamp para evitar caché
-      qrCard.style.display = 'block';
-    } else {
-      qrCard.style.display = 'none';
-    }
-  } catch(e) {
-    qrCard.style.display = 'none';
-  }
+function channelHeaders() {
+  const headers = {"Content-Type": "application/json"};
+  if (channelCsrf) headers["X-Channel-CSRF"] = channelCsrf;
+  return headers;
 }
 
-async function refreshWaStatus() {
-  toast("Verificando estado de WhatsApp...", "success");
-  const r = await fetch("/api/status");
-  const d = await r.json();
-  updateWaStatus(d.wa_running);
-  if (d.wa_running === true) {
-    toast("✅ WhatsApp vinculado!", "success");
-    document.getElementById("wa-qr-card").style.display = 'none';
+function safeAccountLabel(account, fallback) {
+  const parts = [];
+  if (account && account.display_name) parts.push(account.display_name);
+  if (account && account.username) parts.push("@" + account.username);
+  if (account && account.phone_hint) parts.push(account.phone_hint);
+  return parts.length ? parts.join(" · ") : fallback;
+}
+
+function renderChannelState(data) {
+  channelState = data;
+  channelCsrf = data.csrf || channelCsrf;
+
+  const tg = data.telegram || {};
+  const tgInitial = document.getElementById("tg-initial-link");
+  const tgLinked = document.getElementById("tg-linked-actions");
+  const tgSummary = document.getElementById("tg-account-summary");
+  const tgSwitchOpen = document.getElementById("tg-switch-open-btn");
+  tgSwitchOpen.disabled = !data.can_manage || tg.state === "recovery_required";
+  if (tg.linked) {
+    tgInitial.style.display = data.can_manage ? "none" : "block";
+    tgLinked.style.display = data.can_manage ? "block" : "none";
+    tgSummary.textContent = "Cuenta actual: " + safeAccountLabel(tg, "Telegram vinculado");
+    document.getElementById("tg-link-status").innerHTML = data.can_manage
+      ? (tg.state === "recovery_required"
+          ? "❌ <strong>Hay un respaldo pendiente de recuperación manual.</strong> No se reemplazará."
+          : tg.ready
+          ? "✅ <strong>Vinculado y en línea.</strong>"
+          : "⚠️ <strong>Cuenta vinculada, servicio fuera de línea.</strong>")
+      : "🔐 Para administrar desde este navegador, confirma abajo el api_id, api_hash y teléfono actuales.";
   } else {
-    toast("⏳ Todavía no vinculado, intenta de nuevo", "error");
+    tgInitial.style.display = "block";
+    tgLinked.style.display = "none";
+    document.getElementById("tg-link-status").innerHTML =
+      "⚠️ Sin vincular. Ingresa api_id, api_hash y teléfono una sola vez.";
+  }
+
+  const wa = data.whatsapp || {};
+  const waBtn = document.getElementById("wa-switch-btn");
+  const waSummary = document.getElementById("wa-account-summary");
+  waBtn.disabled = !data.can_manage || wa.state === "recovery_required" || wa.state === "switching";
+  waBtn.innerHTML = wa.state === "switching"
+    ? "⏳ Cambio en curso…"
+    : wa.reauth_required
+      ? "📲 Volver a vincular"
+      : wa.linked ? "🔁 Cambiar cuenta" : "📲 Vincular WhatsApp";
+  waSummary.textContent = wa.linked
+    ? "Cuenta actual: " + safeAccountLabel(wa, "WhatsApp vinculado")
+    : (data.can_manage
+        ? "Todavía no hay una cuenta vinculada."
+        : "Vincula Telegram primero para habilitar la administración segura.");
+  if (wa.state === "recovery_required") {
+    document.getElementById("wa-link-status").innerHTML =
+      "❌ El cambio requiere recuperación manual. El respaldo se mantiene protegido.";
+  } else if (wa.state !== "switching") {
+    const waStatus = document.getElementById("wa-link-status");
+    if (wa.reauth_required) {
+      waStatus.innerHTML = "⚠️ WhatsApp cerró esta sesión. Usa <strong>Volver a vincular</strong>.";
+    } else if (wa.linked && !wa.ready) {
+      waStatus.innerHTML = "⚠️ Cuenta conservada, pero el servicio está desconectado. Prueba <strong>Reiniciar servicio WA</strong>.";
+    } else if (wa.ready) {
+      waStatus.innerHTML = "✅ <strong>Vinculado y en línea.</strong>";
+    }
+  }
+  if (wa.state === "switching" && !waSwitchPolling) {
+    document.getElementById("wa-qr-card").style.display = "block";
+    beginWaSwitchPolling();
   }
 }
 
-function showSetup() {
+async function loadChannelState() {
+  try {
+    const r = await fetch("/api/channels", {cache: "no-store"});
+    const data = await r.json();
+    if (r.ok && data.ok) renderChannelState(data);
+    return data;
+  } catch(e) {
+    return null;
+  }
+}
+
+async function showSetup() {
   document.getElementById("setup-modal").style.display = 'block';
-  document.getElementById("tg-code-section").style.display = 'none';
-  fetch("/api/tg_status").then(r => r.json()).then(d => {
-    const el = document.getElementById("tg-link-status");
-    if (d.ready) {
-      el.innerHTML = '✅ <strong>Vinculado y en línea</strong>';
-      document.getElementById("tg-api-id").placeholder = 'Ya configurado';
-      document.getElementById("tg-api-hash").placeholder = 'Ya configurado';
-      document.getElementById("tg-phone").placeholder = 'Ya configurado';
-    } else if (d.linked) {
-      el.innerHTML = '⚠️ <strong>Sesión autorizada, proceso fuera de línea.</strong> Pulsa Reiniciar TG.';
-    } else if (d.configured) {
-      el.innerHTML = '⚠️ Las credenciales existen, pero falta verificar la sesión.';
-    } else {
-      el.innerHTML = '⚠️ Sin vincular. Ingresa api_id, api_hash y número de teléfono.';
+  if (!tgAuthAttempt) {
+    document.getElementById("tg-code-section").style.display = 'none';
+    document.getElementById("tg-2fa-section").style.display = 'none';
+  }
+  await loadChannelState();
+  if (tgAuthAttempt) {
+    document.getElementById("tg-code-section").style.display = 'block';
+    if (tgAuthMode === "switch") {
+      document.getElementById("tg-switch-section").style.display = 'block';
+      document.getElementById("tg-link-status").innerHTML =
+        '📨 Continúa con el código pendiente. La cuenta anterior sigue activa.';
     }
-  }).catch(() => {});
+  }
   // BotFather status
   fetch("/api/bf_status").then(r => r.json()).then(d => {
     const el = document.getElementById("bf-link-status");
@@ -707,12 +822,12 @@ function showSetup() {
 let tgRetryTimer = null;
 let tgAuthAttempt = sessionStorage.getItem("tg_auth_attempt") || null;
 function armTgRetry(seconds) {
-  const btn = document.getElementById("tg-link-btn");
+  const btn = document.getElementById(tgAuthMode === "switch" ? "tg-switch-btn" : "tg-link-btn");
   let remaining = Math.max(0, Number(seconds) || 0);
   if (tgRetryTimer) clearInterval(tgRetryTimer);
   if (remaining <= 0) {
     btn.disabled = false;
-    btn.innerHTML = '🔗 Solicitar otro código';
+    btn.innerHTML = tgAuthMode === "switch" ? '📨 Enviar código' : '🔗 Solicitar otro código';
     return;
   }
   btn.disabled = true;
@@ -723,14 +838,109 @@ function armTgRetry(seconds) {
       clearInterval(tgRetryTimer);
       tgRetryTimer = null;
       btn.disabled = false;
-      btn.innerHTML = '🔗 Solicitar otro código';
+      btn.innerHTML = tgAuthMode === "switch" ? '📨 Enviar código' : '🔗 Solicitar otro código';
     } else {
       btn.textContent = `Espera ${remaining}s`;
     }
   }, 1000);
 }
 
+function rememberTgAttempt(mode, token) {
+  tgAuthMode = mode;
+  sessionStorage.setItem("tg_auth_mode", mode);
+  if (token) {
+    tgAuthAttempt = token;
+    sessionStorage.setItem("tg_auth_attempt", token);
+  }
+}
+
+function clearTgAttempt() {
+  tgAuthAttempt = null;
+  tgAuthMode = "link";
+  sessionStorage.removeItem("tg_auth_attempt");
+  sessionStorage.removeItem("tg_auth_mode");
+  if (tgRetryTimer) clearInterval(tgRetryTimer);
+  tgRetryTimer = null;
+}
+
+function showTelegramSwitch() {
+  if (!channelState || !channelState.can_manage) {
+    toast("❌ Esta sesión del panel no puede cambiar canales.", "error");
+    return;
+  }
+  document.getElementById("tg-switch-section").style.display = "block";
+  document.getElementById("tg-switch-phone").focus();
+}
+
+async function hideTelegramSwitch() {
+  if (tgAuthMode === "switch" && tgAuthAttempt) {
+    await cancelTgAuth();
+  }
+  document.getElementById("tg-switch-section").style.display = "none";
+  document.getElementById("tg-switch-phone").value = "";
+}
+
+async function startTelegramSwitch() {
+  const phone = document.getElementById("tg-switch-phone").value.trim();
+  if (!phone) { toast("❌ Ingresa el teléfono de la nueva cuenta", "error"); return; }
+  rememberTgAttempt("switch", tgAuthAttempt);
+  const btn = document.getElementById("tg-switch-btn");
+  btn.disabled = true;
+  btn.innerHTML = "⏳ Solicitando...";
+  const currentReady = Boolean(channelState && channelState.telegram && channelState.telegram.ready);
+  document.getElementById("tg-link-status").innerHTML = currentReady
+    ? "🔄 Solicitando el código. La cuenta actual sigue atendiendo."
+    : "🔄 Solicitando el código. Los archivos de la sesión actual se conservarán.";
+  try {
+    const r = await fetch("/api/switch_telegram", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: JSON.stringify({phone, auth_attempt: tgAuthAttempt})
+    });
+    const d = await r.json();
+    if (d.needs_code) {
+      rememberTgAttempt("switch", d.auth_attempt || tgAuthAttempt);
+      if (!tgAuthAttempt || d.owned_by_this_browser === false) {
+        document.getElementById("tg-link-status").innerHTML =
+          "⚠️ Ya existe una autorización activa en otro navegador.";
+        armTgRetry(d.retry_after ?? 30);
+        return;
+      }
+      document.getElementById("tg-code-section").style.display = "block";
+      document.getElementById("tg-code-input").value = "";
+      document.getElementById("tg-code-input").focus();
+      document.getElementById("tg-code-status").innerHTML = "";
+      document.getElementById("tg-code-help").textContent =
+        `Busca el código en ${d.delivery || "el canal elegido por Telegram"}.`;
+      document.getElementById("tg-link-status").innerHTML =
+        "📨 Código solicitado. La cuenta anterior continuará activa hasta confirmar la nueva.";
+      armTgRetry(d.retry_after ?? d.timeout_seconds ?? 30);
+    } else if (d.ok && d.switched) {
+      clearTgAttempt();
+      document.getElementById("tg-code-section").style.display = "none";
+      document.getElementById("tg-switch-section").style.display = "none";
+      toast("✅ Cuenta de Telegram cambiada", "success");
+      await loadChannelState();
+      btn.disabled = false;
+      btn.innerHTML = "📨 Enviar código";
+    } else {
+      toast("❌ " + (d.error || "No fue posible iniciar el cambio"), "error");
+      document.getElementById("tg-link-status").innerHTML = "❌ " + (d.error || "Error");
+      if (d.retry_after) armTgRetry(d.retry_after);
+      else {
+        btn.disabled = false;
+        btn.innerHTML = "📨 Enviar código";
+      }
+    }
+  } catch(e) {
+    toast("❌ Error: " + e.message, "error");
+    btn.disabled = false;
+    btn.innerHTML = "📨 Enviar código";
+  }
+}
+
 async function linkTelegram() {
+  rememberTgAttempt("link", tgAuthAttempt);
   const api_id = document.getElementById("tg-api-id").value.trim();
   const api_hash = document.getElementById("tg-api-hash").value.trim();
   const phone = document.getElementById("tg-phone").value.trim();
@@ -754,8 +964,7 @@ async function linkTelegram() {
     const d = await r.json();
     if (d.needs_code) {
       if (d.auth_attempt) {
-        tgAuthAttempt = d.auth_attempt;
-        sessionStorage.setItem("tg_auth_attempt", tgAuthAttempt);
+        rememberTgAttempt("link", d.auth_attempt);
       }
       if (!tgAuthAttempt || d.owned_by_this_browser === false) {
         document.getElementById("tg-code-section").style.display = 'none';
@@ -775,11 +984,11 @@ async function linkTelegram() {
       document.getElementById("tg-link-status").innerHTML = `📨 ${prefix} No solicites otro hasta que termine la espera.`;
       armTgRetry(d.retry_after ?? d.timeout_seconds ?? 30);
     } else if (d.ok) {
-      tgAuthAttempt = null;
-      sessionStorage.removeItem("tg_auth_attempt");
+      clearTgAttempt();
       document.getElementById("tg-api-hash").value = '';
       toast("✅ Vinculado. El bot se conectará como usuario.", "success");
       document.getElementById("tg-link-status").innerHTML = '✅ <strong>Sesión autorizada; iniciando Telegram…</strong>';
+      await loadChannelState();
       setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
       btn.disabled = false;
       btn.innerHTML = '🔗 Vincular';
@@ -806,20 +1015,25 @@ async function verifyTgCode() {
 
   document.getElementById("tg-code-status").innerHTML = '🔄 Verificando...';
   try {
-    const r = await fetch("/api/verify_telegram_code", {
+    const switching = tgAuthMode === "switch";
+    const r = await fetch(switching ? "/api/switch_telegram/code" : "/api/verify_telegram_code", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: switching ? channelHeaders() : {"Content-Type": "application/json"},
       body: JSON.stringify({code, auth_attempt: tgAuthAttempt})
     });
     const d = await r.json();
     if (d.ok) {
-      tgAuthAttempt = null;
-      sessionStorage.removeItem("tg_auth_attempt");
+      const wasSwitch = switching;
+      clearTgAttempt();
       document.getElementById("tg-api-hash").value = '';
-      toast("✅ ¡Vinculado correctamente!", "success");
-      document.getElementById("tg-link-status").innerHTML = '✅ <strong>Vinculado</strong>';
+      toast(wasSwitch ? "✅ Cuenta de Telegram cambiada" : "✅ ¡Vinculado correctamente!", "success");
+      document.getElementById("tg-link-status").innerHTML = wasSwitch
+        ? '✅ <strong>Cuenta cambiada y verificada.</strong>'
+        : '✅ <strong>Vinculado</strong>';
       document.getElementById("tg-code-section").style.display = 'none';
-      setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
+      document.getElementById("tg-switch-section").style.display = 'none';
+      await loadChannelState();
+      if (!wasSwitch) setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
     } else if (d.needs_password) {
       // 2FA requerido
       document.getElementById("tg-2fa-section").style.display = 'block';
@@ -840,21 +1054,26 @@ async function verifyTgPassword() {
 
   document.getElementById("tg-password-status").innerHTML = '🔄 Verificando...';
   try {
-    const r = await fetch("/api/verify_telegram_password", {
+    const switching = tgAuthMode === "switch";
+    const r = await fetch(switching ? "/api/switch_telegram/password" : "/api/verify_telegram_password", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: switching ? channelHeaders() : {"Content-Type": "application/json"},
       body: JSON.stringify({password, auth_attempt: tgAuthAttempt})
     });
     const d = await r.json();
     if (d.ok) {
-      tgAuthAttempt = null;
-      sessionStorage.removeItem("tg_auth_attempt");
+      const wasSwitch = switching;
+      clearTgAttempt();
       document.getElementById("tg-api-hash").value = '';
-      toast("✅ ¡Vinculado correctamente!", "success");
-      document.getElementById("tg-link-status").innerHTML = '✅ <strong>Vinculado</strong>';
+      toast(wasSwitch ? "✅ Cuenta de Telegram cambiada" : "✅ ¡Vinculado correctamente!", "success");
+      document.getElementById("tg-link-status").innerHTML = wasSwitch
+        ? '✅ <strong>Cuenta cambiada y verificada.</strong>'
+        : '✅ <strong>Vinculado</strong>';
       document.getElementById("tg-code-section").style.display = 'none';
       document.getElementById("tg-2fa-section").style.display = 'none';
-      setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
+      document.getElementById("tg-switch-section").style.display = 'none';
+      await loadChannelState();
+      if (!wasSwitch) setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
     } else {
       document.getElementById("tg-password-status").innerHTML = '❌ ' + (d.error || "Contraseña incorrecta");
     }
@@ -864,24 +1083,24 @@ async function verifyTgPassword() {
 }
 
 async function cancelTgAuth() {
-  await fetch("/api/cancel_telegram_auth", {
+  const switching = tgAuthMode === "switch";
+  await fetch(switching ? "/api/switch_telegram/cancel" : "/api/cancel_telegram_auth", {
     method: "POST",
-    headers: {"Content-Type": "application/json"},
+    headers: switching ? channelHeaders() : {"Content-Type": "application/json"},
     body: JSON.stringify({auth_attempt: tgAuthAttempt})
   }).catch(() => {});
-  tgAuthAttempt = null;
-  sessionStorage.removeItem("tg_auth_attempt");
-  if (tgRetryTimer) clearInterval(tgRetryTimer);
-  tgRetryTimer = null;
-  const btn = document.getElementById("tg-link-btn");
+  clearTgAttempt();
+  const btn = document.getElementById(switching ? "tg-switch-btn" : "tg-link-btn");
   btn.disabled = false;
-  btn.innerHTML = '🔗 Vincular';
+  btn.innerHTML = switching ? '📨 Enviar código' : '🔗 Vincular';
   document.getElementById("tg-api-hash").value = '';
   document.getElementById("tg-code-input").value = '';
   document.getElementById("tg-password-input").value = '';
   document.getElementById("tg-code-section").style.display = 'none';
   document.getElementById("tg-2fa-section").style.display = 'none';
-  document.getElementById("tg-link-status").innerHTML = '⚠️ Vinculación cancelada. Intenta de nuevo.';
+  document.getElementById("tg-link-status").innerHTML = switching
+    ? 'ℹ️ Cambio cancelado. La cuenta anterior sigue activa.'
+    : '⚠️ Vinculación cancelada. Intenta de nuevo.';
 }
 
 async function linkBotFather() {
@@ -912,28 +1131,181 @@ async function linkBotFather() {
   }
 }
 
-async function launchWaAndShowQr() {
-  document.getElementById("wa-link-status").innerHTML = '🔄 Limpiando sesión anterior y lanzando WhatsApp bot...';
+function setWaSwitchCancelDisabled(disabled) {
+  document.querySelectorAll(".wa-switch-cancel").forEach(button => {
+    button.disabled = disabled;
+  });
+}
+
+function stopWaSwitchPolling() {
+  waSwitchGeneration += 1;
+  waSwitchPolling = false;
+  if (waSwitchPollTimer) clearTimeout(waSwitchPollTimer);
+  waSwitchPollTimer = null;
+  if (waSwitchPollAbortController) waSwitchPollAbortController.abort();
+  waSwitchPollAbortController = null;
+  waCommitInFlight = false;
+}
+
+function beginWaSwitchPolling() {
+  stopWaSwitchPolling();
+  waSwitchPolling = true;
+  setWaSwitchCancelDisabled(false);
+  waSwitchPollAbortController = new AbortController();
+  pollWaSwitch(waSwitchGeneration);
+}
+
+async function startWaSwitch() {
+  const current = (channelState && channelState.whatsapp) || {};
+  const linked = Boolean(current.linked);
+  const ready = Boolean(current.ready);
+  const question = linked
+    ? (ready
+        ? "¿Cambiar la cuenta de WhatsApp? La cuenta actual seguirá atendiendo hasta que la nueva quede vinculada."
+        : "¿Volver a vincular WhatsApp? La sesión actual está desconectada, pero sus archivos se conservarán durante el cambio.")
+    : "¿Vincular esta instalación con una cuenta de WhatsApp?";
+  if (!confirm(question)) return;
+  const btn = document.getElementById("wa-switch-btn");
+  btn.disabled = true;
+  document.getElementById("wa-link-status").innerHTML = linked && ready
+    ? "🔄 Preparando el cambio sin desconectar la cuenta actual..."
+    : linked
+      ? "🔄 Preparando una nueva vinculación; la sesión anterior queda respaldada..."
+      : "🔄 Preparando el QR...";
   try {
-    // Primero limpiar sesión vieja
-    await fetch("/api/reset_wa", { method: "POST" });
-    // Luego lanzar
-    const r = await fetch("/api/restart_wa_bot", { method: "POST" });
+    const r = await fetch("/api/switch_wa", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: JSON.stringify({confirm: true})
+    });
     const d = await r.json();
-    if (d.ok) {
-      document.getElementById("wa-link-status").innerHTML = '✅ Bot WhatsApp lanzado. Espera unos segundos y haz click en "Mostrar QR"';
-      toast("✅ WA bot lanzado, el QR aparecerá en segundos", "success");
-      setTimeout(loadWaQr, 5000);
+    if (r.ok && d.ok) {
+      document.getElementById("wa-qr-card").style.display = "block";
+      document.getElementById("wa-qr-img").removeAttribute("src");
+      document.getElementById("wa-qr-help").textContent = "Preparando un QR seguro…";
+      beginWaSwitchPolling();
+    } else if (d.error_code === "switch_in_progress") {
+      document.getElementById("wa-qr-card").style.display = "block";
+      beginWaSwitchPolling();
     } else {
-      document.getElementById("wa-link-status").innerHTML = '❌ ' + (d.error || "Error");
+      btn.disabled = false;
+      document.getElementById("wa-link-status").innerHTML = "❌ " + (d.error || "Error");
+      toast("❌ " + (d.error || "No fue posible preparar el cambio"), "error");
     }
   } catch(e) {
-    document.getElementById("wa-link-status").innerHTML = '❌ Error: ' + e.message;
+    btn.disabled = false;
+    document.getElementById("wa-link-status").innerHTML = "❌ Error: " + e.message;
   }
+}
+
+async function pollWaSwitch(generation) {
+  if (!waSwitchPolling || generation !== waSwitchGeneration) return;
+  const help = document.getElementById("wa-qr-help");
+  const img = document.getElementById("wa-qr-img");
+  try {
+    const r = await fetch("/api/switch_wa/status", {
+      cache: "no-store",
+      signal: waSwitchPollAbortController?.signal
+    });
+    const d = await r.json();
+    // Cancelar invalida la generación y aborta la consulta. Esta segunda
+    // comprobación evita promover una cuenta con una respuesta ya resuelta.
+    if (!waSwitchPolling || generation !== waSwitchGeneration) return;
+    if (d.ready_to_commit && !waCommitInFlight) {
+      waCommitInFlight = true;
+      setWaSwitchCancelDisabled(true);
+      await commitWaSwitch(generation);
+      return;
+    }
+    if (!r.ok && d.state !== "preparing" && d.state !== "awaiting_qr") {
+      stopWaSwitchPolling();
+      setWaSwitchCancelDisabled(false);
+      document.getElementById("wa-qr-card").style.display = "none";
+      document.getElementById("wa-switch-btn").disabled = false;
+      document.getElementById("wa-link-status").innerHTML = "❌ " + (d.error || "El cambio no se completó.");
+      toast("⚠️ " + (d.error || "La cuenta anterior sigue activa"), "error");
+      await loadChannelState();
+      return;
+    }
+    if (d.qr_ready) {
+      help.textContent = "Escanea este QR. Confirmaremos el cambio automáticamente.";
+      img.src = "/api/switch_wa/qr?ts=" + Date.now();
+    } else {
+      help.textContent = "Preparando un QR seguro…";
+    }
+  } catch(e) {
+    if (e.name === "AbortError" || !waSwitchPolling || generation !== waSwitchGeneration) return;
+    help.textContent = "Reconectando con el servidor…";
+  }
+  if (waSwitchPolling && generation === waSwitchGeneration) {
+    waSwitchPollTimer = setTimeout(() => pollWaSwitch(generation), 1200);
+  }
+}
+
+async function commitWaSwitch(generation) {
+  if (!waSwitchPolling || generation !== waSwitchGeneration || !waCommitInFlight) return;
+  const help = document.getElementById("wa-qr-help");
+  help.textContent = "Cuenta verificada. Activando el cambio…";
+  try {
+    const r = await fetch("/api/switch_wa/commit", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: "{}"
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || "No fue posible activar la cuenta nueva");
+    stopWaSwitchPolling();
+    setWaSwitchCancelDisabled(false);
+    document.getElementById("wa-qr-card").style.display = "none";
+    document.getElementById("wa-link-status").innerHTML = "✅ Cuenta vinculada y verificada.";
+    toast("✅ Cuenta de WhatsApp cambiada", "success");
+    await loadChannelState();
+  } catch(e) {
+    stopWaSwitchPolling();
+    setWaSwitchCancelDisabled(false);
+    document.getElementById("wa-qr-card").style.display = "none";
+    document.getElementById("wa-switch-btn").disabled = false;
+    document.getElementById("wa-link-status").innerHTML = "❌ " + e.message;
+    toast("⚠️ " + e.message, "error");
+    await loadChannelState();
+  }
+}
+
+async function cancelWaSwitch() {
+  if (waCommitInFlight) {
+    setWaSwitchCancelDisabled(true);
+    toast("⏳ La cuenta ya fue verificada y se está activando; esta etapa no puede cancelarse.", "error");
+    return;
+  }
+  stopWaSwitchPolling();
+  setWaSwitchCancelDisabled(true);
+  try {
+    const r = await fetch("/api/switch_wa/cancel", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: "{}"
+    });
+    const d = await r.json();
+    if (r.status === 404) {
+      document.getElementById("wa-link-status").textContent =
+        "El cambio ya había finalizado o no seguía activo; se actualizó el estado.";
+    } else {
+      if (!r.ok || !d.ok) throw new Error(d.error || "No fue posible cancelar");
+      document.getElementById("wa-link-status").innerHTML =
+        "ℹ️ Cambio cancelado. La cuenta anterior sigue activa.";
+    }
+  } catch(e) {
+    toast("❌ " + e.message, "error");
+  }
+  document.getElementById("wa-qr-card").style.display = "none";
+  document.getElementById("wa-switch-btn").disabled = false;
+  setWaSwitchCancelDisabled(false);
+  await loadChannelState();
 }
 
 // Auto-refresh cada 10 segundos
 loadData();
+loadChannelState();
 setInterval(loadData, 10000);
 // Auto-iniciar BotFather si hay token configurado
 fetch("/api/start_botfather", {method:"POST"}).catch(()=>{});
@@ -982,6 +1354,83 @@ def _read_env_var(key: str) -> str | None:
             line = line.strip()
             if line.startswith(f"{key}="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def _mask_phone(phone: str | None) -> str | None:
+    digits = re.sub(r"\D", "", phone or "")
+    return f"••••{digits[-4:]}" if len(digits) >= 4 else None
+
+
+def _read_safe_identity(file_path: Path) -> dict:
+    try:
+        parsed = json.loads(file_path.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            return {}
+        return {
+            "display_name": str(parsed.get("display_name") or "")[:120] or None,
+            "username": str(parsed.get("username") or "")[:64] or None,
+            "phone_hint": str(parsed.get("phone_hint") or "")[:16] or None,
+        }
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def _secure_directory(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+
+
+def _directory_has_entries(directory: Path) -> bool:
+    try:
+        return directory.is_dir() and any(directory.iterdir())
+    except OSError:
+        return True
+
+
+def _telegram_recovery_pending() -> bool:
+    """Nunca pisa un respaldo que todavía requiere intervención."""
+
+    return _directory_has_entries(TG_SWITCH_ROLLBACK_DIR)
+
+
+def _whatsapp_recovery_pending() -> bool:
+    """Detecta respaldos apartados fuera del staging transaccional."""
+
+    return _directory_has_entries(WA_SWITCH_RECOVERY_ROOT)
+
+
+def _channel_csrf_token() -> str:
+    token = session.get("channel_csrf")
+    if not isinstance(token, str) or len(token) < 32:
+        token = secrets.token_urlsafe(32)
+        session["channel_csrf"] = token
+        session.permanent = True
+    return token
+
+
+def _can_manage_channels() -> bool:
+    return bool(session.get("telegram_admin") or session.get("wa_admin"))
+
+
+def _channel_mutation_error():
+    if not _can_manage_channels():
+        return jsonify({
+            "ok": False,
+            "error_code": "admin_required",
+            "error": "Abre el panel desde el navegador que vinculó los canales.",
+        }), 403
+    supplied = request.headers.get("X-Channel-CSRF", "")
+    expected = _channel_csrf_token()
+    if not supplied or not secrets.compare_digest(supplied, expected):
+        return jsonify({
+            "ok": False,
+            "error_code": "csrf_invalid",
+            "error": "La sesión del panel cambió. Recarga la página e intenta nuevamente.",
+        }), 403
     return None
 
 
@@ -1054,9 +1503,23 @@ def _save_telegram_creds(api_id, api_hash, phone):
     os.replace(temp_file, env_file)
 
 
-def _telegram_session_has_auth_key() -> bool:
+def _telegram_session_artifacts(session_base: Path) -> list[Path]:
+    return [Path(f"{session_base}{suffix}") for suffix in (
+        ".session",
+        ".session-journal",
+        ".session-wal",
+        ".session-shm",
+    )]
+
+
+def _remove_telegram_session_artifacts(session_base: Path) -> None:
+    for artifact in _telegram_session_artifacts(session_base):
+        artifact.unlink(missing_ok=True)
+
+
+def _telegram_session_has_auth_key(session_base: Path = TG_SESSION_BASE) -> bool:
     """Comprueba la clave MTProto; por sí sola no prueba login de usuario."""
-    session_path = DATA_DIR / "tg_session.session"
+    session_path = Path(f"{session_base}.session")
     if not session_path.is_file() or session_path.stat().st_size == 0:
         return False
     try:
@@ -1113,6 +1576,30 @@ def _tracked_telegram_pid() -> int | None:
         return None
 
 
+def _windows_process_command_line(pid: int) -> str:
+    """Obtiene la línea de comando para no terminar un PID reciclado en Windows."""
+
+    if sys.platform != "win32" or pid <= 1:
+        return ""
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {int(pid)}').CommandLine",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+
+
 def _is_telegram_worker_pid(pid: int) -> bool:
     """Evita terminar BotFather u otro proceso si el PID quedó obsoleto."""
     if sys.platform != "win32":
@@ -1121,7 +1608,8 @@ def _is_telegram_worker_pid(pid: int) -> bool:
             return "bot.py" in cmdline and "botfather_bot.py" not in cmdline and "restart_bot.py" not in cmdline
         except OSError:
             return False
-    return True
+    cmdline = _windows_process_command_line(pid).lower()
+    return "bot.py" in cmdline and "botfather_bot.py" not in cmdline and "restart_bot.py" not in cmdline
 
 
 def _stop_telegram_worker() -> None:
@@ -1193,6 +1681,161 @@ def bot_is_running():
     pid = _tracked_telegram_pid()
     return bool(pid and _is_telegram_worker_pid(pid) and _telegram_heartbeat_is_fresh())
 
+
+def _copy_file_atomic(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(f"{destination}.switch.tmp")
+    shutil.copy2(source, temporary)
+    os.replace(temporary, destination)
+
+
+def _restore_optional_file(backup_dir: Path, destination: Path) -> None:
+    destination.unlink(missing_ok=True)
+    backup = backup_dir / destination.name
+    if backup.is_file():
+        _copy_file_atomic(backup, destination)
+
+
+def _wait_until(predicate, timeout_seconds: float, interval_seconds: float = 0.25) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            if predicate():
+                return True
+        except Exception:
+            pass
+        time.sleep(interval_seconds)
+    return False
+
+
+def _promote_telegram_candidate(
+    api_id: int,
+    api_hash: str,
+    phone: str,
+) -> tuple[bool, str, bool, bool]:
+    """Activa una sesión candidata y restaura la anterior ante cualquier fallo."""
+
+    candidate_session = Path(f"{TG_SWITCH_SESSION_BASE}.session")
+    if not _telegram_session_has_auth_key(TG_SWITCH_SESSION_BASE):
+        return (
+            False,
+            "La nueva sesión no quedó autorizada; la cuenta anterior no fue modificada.",
+            True,
+            bot_is_running(),
+        )
+
+    if _telegram_recovery_pending():
+        return (
+            False,
+            "Hay un respaldo anterior pendiente de recuperación; no se reemplazó ningún archivo.",
+            True,
+            bot_is_running(),
+        )
+
+    with _telegram_switch_lock:
+        old_credentials = {
+            "TG_API_ID": os.environ.get("TG_API_ID") or _read_env_var("TG_API_ID"),
+            "TG_API_HASH": os.environ.get("TG_API_HASH") or _read_env_var("TG_API_HASH"),
+            "TG_PHONE": os.environ.get("TG_PHONE") or _read_env_var("TG_PHONE"),
+        }
+        old_was_running = bot_is_running()
+        env_file = DATA_DIR / ".env.local"
+        marker = DATA_DIR / "tg_session_authorized.json"
+        interaction_state_file = DATA_DIR / "tg_interaction_state.json"
+        identity_file = DATA_DIR / "tg_identity.json"
+
+        _stop_telegram_worker()
+        if TG_SWITCH_ROLLBACK_DIR.exists():
+            shutil.rmtree(TG_SWITCH_ROLLBACK_DIR)
+        _secure_directory(TG_SWITCH_ROLLBACK_DIR)
+        try:
+            os.chmod(candidate_session, 0o600)
+        except OSError:
+            pass
+
+        backup_files = [
+            *_telegram_session_artifacts(TG_SESSION_BASE),
+            env_file,
+            marker,
+            interaction_state_file,
+            identity_file,
+        ]
+        try:
+            for source in backup_files:
+                if source.is_file():
+                    shutil.copy2(source, TG_SWITCH_ROLLBACK_DIR / source.name)
+        except Exception:
+            old_ready = False
+            if old_was_running and _telegram_session_is_authorized():
+                started, _ = restart_telegram_worker()
+                old_ready = started and _wait_until(bot_is_running, 15)
+            if old_ready:
+                shutil.rmtree(TG_SWITCH_ROLLBACK_DIR, ignore_errors=True)
+            message = (
+                "No se pudo preparar el cambio; la cuenta anterior sigue disponible."
+                if old_ready
+                else "No se pudo preparar el cambio y el servicio anterior no volvió a quedar en línea."
+            )
+            return False, message, True, old_ready
+
+        try:
+            _remove_telegram_session_artifacts(TG_SESSION_BASE)
+            _copy_file_atomic(candidate_session, Path(f"{TG_SESSION_BASE}.session"))
+            _save_telegram_creds(api_id, api_hash, phone)
+            os.environ.update({
+                "TG_API_ID": str(api_id),
+                "TG_API_HASH": api_hash,
+                "TG_PHONE": phone,
+            })
+            _write_telegram_authorized_marker()
+            interaction_state_file.unlink(missing_ok=True)
+            identity_file.unlink(missing_ok=True)
+
+            started, _message = restart_telegram_worker()
+            if not started or not _wait_until(bot_is_running, 15):
+                raise RuntimeError("new_worker_not_ready")
+        except Exception:
+            restored = True
+            try:
+                _stop_telegram_worker()
+                _remove_telegram_session_artifacts(TG_SESSION_BASE)
+                for destination in backup_files:
+                    _restore_optional_file(TG_SWITCH_ROLLBACK_DIR, destination)
+            except Exception:
+                restored = False
+            for key, value in old_credentials.items():
+                if value:
+                    os.environ[key] = str(value)
+                else:
+                    os.environ.pop(key, None)
+
+            old_ready = False
+            if restored and old_was_running and _telegram_session_is_authorized():
+                try:
+                    started, _ = restart_telegram_worker()
+                    old_ready = started and _wait_until(bot_is_running, 15)
+                except Exception:
+                    old_ready = False
+
+            if restored:
+                _remove_telegram_session_artifacts(TG_SWITCH_SESSION_BASE)
+                shutil.rmtree(TG_SWITCH_ROLLBACK_DIR, ignore_errors=True)
+                message = (
+                    "No se pudo activar la cuenta nueva; la anterior fue restaurada."
+                    if old_ready
+                    else "La cuenta anterior fue restaurada, pero su servicio no volvió a quedar en línea."
+                )
+            else:
+                message = (
+                    "Falló la activación y la restauración automática. "
+                    "El respaldo se conservó para recuperación manual."
+                )
+            return False, message, restored, old_ready
+
+        _remove_telegram_session_artifacts(TG_SWITCH_SESSION_BASE)
+        shutil.rmtree(TG_SWITCH_ROLLBACK_DIR, ignore_errors=True)
+        return True, "Cuenta de Telegram cambiada y verificada.", True, True
+
 @app.route("/")
 def index():
     return render_template_string(TEMPLATE)
@@ -1235,10 +1878,15 @@ def api_data():
 
 @app.route("/api/wa_qr")
 def api_wa_qr():
-    """Sirve la imagen QR generada por el bot de WhatsApp."""
+    """Compatibilidad: nunca expone un QR fuera de una sesión administradora."""
+    if not _can_manage_channels():
+        return jsonify({"ok": False, "error": "Sesión administrativa requerida."}), 403
     qr_path = BASE_DIR / "wa_qr.png"
     if qr_path.exists():
-        return send_from_directory(str(BASE_DIR), "wa_qr.png")
+        response = send_from_directory(str(BASE_DIR), "wa_qr.png")
+        response.headers["Cache-Control"] = "no-store, private"
+        response.headers["Pragma"] = "no-cache"
+        return response
     return "QR not yet generated", 404
 
 
@@ -1258,6 +1906,8 @@ _WA_CALL_HEALTH_DEFAULT = {
     "worker_running": False,
     "worker_revision": None,
     "connection": "unknown",
+    "disconnect_reason": "unknown",
+    "reauth_required": False,
     "listener": "unknown",
     "raw_listener": "unknown",
     "raw_call_revision": None,
@@ -1295,12 +1945,12 @@ def _safe_enum(value, choices, fallback):
     return value if isinstance(value, str) and value in choices else fallback
 
 
-def _read_wa_call_health():
+def _read_wa_call_health(file_path: Path = WA_CALL_HEALTH_FILE):
     result = json.loads(json.dumps(_WA_CALL_HEALTH_DEFAULT))
-    if not WA_CALL_HEALTH_FILE.exists():
+    if not file_path.exists():
         return result
     try:
-        with open(WA_CALL_HEALTH_FILE, "r", encoding="utf-8") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
     except (OSError, ValueError, TypeError):
         return result
@@ -1316,6 +1966,12 @@ def _read_wa_call_health():
         {"starting", "connecting", "open", "closed", "unknown"},
         "unknown",
     )
+    result["disconnect_reason"] = _safe_enum(
+        raw.get("disconnect_reason"),
+        {"never", "transient", "logged_out", "session_invalid", "timeout", "shutdown", "unknown"},
+        "unknown",
+    )
+    result["reauth_required"] = raw.get("reauth_required") is True
     result["listener"] = _safe_enum(
         raw.get("listener"), {"pending", "registered", "unknown"}, "unknown"
     )
@@ -1385,10 +2041,78 @@ def _read_wa_call_health():
 def api_wa_call_health():
     """Returns only an allowlisted, identifier-free call pipeline snapshot."""
     health = _read_wa_call_health()
-    worker_running = wa_is_running()
+    worker_running = _wa_process_running(DATA_DIR / "wa_bot.pid")
     health["worker_running"] = worker_running
-    if worker_running is not True:
-        health["connection"] = "closed" if worker_running is False else "unknown"
+    if not worker_running:
+        health["connection"] = "closed"
+    response = jsonify(health)
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+def _read_tg_interaction_health() -> dict:
+    result = {
+        "available": False,
+        "worker_running": False,
+        "worker_revision": None,
+        "connection": "unknown",
+        "raw_phone_revision": None,
+        "phone_subtype": "never",
+        "service_call_revision": None,
+        "classified_revision": None,
+        "last_kind": "never",
+        "last_response": "never",
+        "delivery": {
+            "peer_resolution": "never",
+            "text": "never",
+            "audio": "never",
+        },
+    }
+    file_path = DATA_DIR / "tg_interaction_health.json"
+    try:
+        raw = json.loads(file_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return result
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        return result
+
+    result["available"] = True
+    result["worker_revision"] = _safe_uuid(raw.get("worker_revision"))
+    result["connection"] = _safe_enum(
+        raw.get("connection"),
+        {"starting", "connecting", "open", "closed", "unknown"},
+        "unknown",
+    )
+    for key in ("raw_phone_revision", "service_call_revision", "classified_revision"):
+        result[key] = _safe_uuid(raw.get(key))
+    result["phone_subtype"] = _safe_enum(
+        raw.get("phone_subtype"), {"requested", "waiting", "other", "never"}, "other"
+    )
+    result["last_kind"] = _safe_enum(
+        raw.get("last_kind"), {"call", "content", "never"}, "never"
+    )
+    result["last_response"] = _safe_enum(
+        raw.get("last_response"), {"call", "step1", "step2", "never"}, "never"
+    )
+    delivery = raw.get("delivery") if isinstance(raw.get("delivery"), dict) else {}
+    delivery_states = {"never", "pending", "sent", "failed", "missing", "skipped"}
+    result["delivery"] = {
+        key: _safe_enum(delivery.get(key), delivery_states, "never")
+        for key in ("peer_resolution", "text", "audio")
+    }
+    return result
+
+
+@app.route("/api/tg_interaction_health")
+def api_tg_interaction_health():
+    """Diagnóstico allowlist de llamadas y entregas, sin IDs de clientes."""
+
+    health = _read_tg_interaction_health()
+    health["worker_running"] = bot_is_running()
+    if not health["worker_running"]:
+        health["connection"] = "closed"
     response = jsonify(health)
     response.headers["Cache-Control"] = "no-store, private"
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -1661,6 +2385,8 @@ def api_tg_status():
         state = "needs_verification"
     else:
         state = "unconfigured"
+    identity = _read_safe_identity(DATA_DIR / "tg_identity.json")
+    can_manage = _can_manage_channels()
     return jsonify({
         "configured": configured,
         "session_authorized": session_authorized,
@@ -1668,7 +2394,10 @@ def api_tg_status():
         "worker_running": worker_running,
         "ready": worker_running,
         "state": state,
-        "display_name": "Cuenta de Telegram" if session_authorized else None,
+        "display_name": identity.get("display_name") if session_authorized and can_manage else None,
+        "username": identity.get("username") if session_authorized and can_manage else None,
+        "phone_hint": _mask_phone(phone) if session_authorized and can_manage else None,
+        "can_switch": session_authorized and can_manage,
     })
 
 
@@ -1701,6 +2430,38 @@ def _finish_telegram_auth(outcome):
     return public
 
 
+def _finish_telegram_switch(outcome):
+    """Promueve únicamente una sesión candidata ya autorizada."""
+
+    public = dict(outcome.public)
+    if outcome.attempt_token:
+        public["auth_attempt"] = outcome.attempt_token
+    if not outcome.credentials:
+        return public
+
+    api_id, api_hash, phone = outcome.credentials
+    switched, message, previous_preserved, previous_ready = _promote_telegram_candidate(
+        api_id, api_hash, phone
+    )
+    public.update({
+        "ok": switched,
+        "authorized": switched,
+        "switched": switched,
+        "message": message,
+    })
+    if switched:
+        session["telegram_admin"] = True
+        session.permanent = True
+    else:
+        public.update({
+            "error_code": "activation_failed",
+            "error": message,
+            "previous_account_preserved": previous_preserved,
+            "previous_worker_ready": previous_ready,
+        })
+    return public
+
+
 @app.route("/api/link_telegram", methods=["POST"])
 def api_link_telegram():
     """Inicia una autorización y describe el canal elegido por Telegram."""
@@ -1727,7 +2488,10 @@ def api_link_telegram():
                 }), 403
             session["telegram_admin"] = True
             session.permanent = True
-        started, message = restart_telegram_worker()
+        if bot_is_running():
+            started, message = True, "Acceso administrativo recuperado; Telegram sigue en línea."
+        else:
+            started, message = restart_telegram_worker()
         return jsonify({
             "ok": started,
             "already_authorized": True,
@@ -1771,6 +2535,103 @@ def api_cancel_telegram_auth():
     """Cancela la autenticación pendiente."""
     data = request.get_json(silent=True) or {}
     return jsonify(_telegram_auth.cancel(data.get("auth_attempt")).public)
+
+
+@app.route("/api/switch_telegram", methods=["POST"])
+def api_switch_telegram():
+    """Autoriza otra cuenta en staging sin detener la cuenta actual."""
+
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    if not _telegram_session_is_authorized():
+        return jsonify({
+            "ok": False,
+            "error_code": "not_linked",
+            "error": "Telegram aún no está vinculado; usa el formulario inicial.",
+        }), 409
+    if _telegram_recovery_pending():
+        return jsonify({
+            "ok": False,
+            "error_code": "recovery_required",
+            "error": "Hay un respaldo de Telegram pendiente de recuperación manual.",
+        }), 409
+
+    data = request.get_json(silent=True) or {}
+    phone = _normalize_telegram_phone(data.get("phone") or "")
+    api_id = os.environ.get("TG_API_ID") or _read_env_var("TG_API_ID")
+    api_hash = os.environ.get("TG_API_HASH") or _read_env_var("TG_API_HASH") or ""
+    current_phone = os.environ.get("TG_PHONE") or _read_env_var("TG_PHONE") or ""
+    if not _valid_telegram_credentials(api_id, api_hash, phone or ""):
+        return jsonify({
+            "ok": False,
+            "error_code": "invalid_input",
+            "error": "Ingresa el nuevo teléfono en formato internacional.",
+        }), 400
+    if secrets.compare_digest(phone or "", current_phone):
+        return jsonify({
+            "ok": False,
+            "error_code": "same_account",
+            "error": "Ese teléfono ya corresponde a la cuenta activa.",
+        }), 409
+
+    attempt_token = data.get("auth_attempt")
+    with _telegram_switch_lock:
+        if not attempt_token and not _telegram_switch_auth.has_pending():
+            _remove_telegram_session_artifacts(TG_SWITCH_SESSION_BASE)
+        outcome = _telegram_switch_auth.begin(
+            int(api_id), api_hash, phone, attempt_token
+        )
+        public = _finish_telegram_switch(outcome)
+    status = 503 if public.get("error_code") == "activation_failed" else 200
+    return jsonify(public), status
+
+
+@app.route("/api/switch_telegram/code", methods=["POST"])
+def api_switch_telegram_code():
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    data = request.get_json(silent=True) or {}
+    code = (data.get("code") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,31}", code):
+        return jsonify({"ok": False, "error": "Ingresa el código recibido."}), 400
+    with _telegram_switch_lock:
+        public = _finish_telegram_switch(
+            _telegram_switch_auth.verify_code(code, data.get("auth_attempt"))
+        )
+    status = 503 if public.get("error_code") == "activation_failed" else 200
+    return jsonify(public), status
+
+
+@app.route("/api/switch_telegram/password", methods=["POST"])
+def api_switch_telegram_password():
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    data = request.get_json(silent=True) or {}
+    password = data.get("password") or ""
+    if not password or len(password) > 256:
+        return jsonify({"ok": False, "error": "Contraseña requerida."}), 400
+    with _telegram_switch_lock:
+        public = _finish_telegram_switch(
+            _telegram_switch_auth.verify_password(password, data.get("auth_attempt"))
+        )
+    status = 503 if public.get("error_code") == "activation_failed" else 200
+    return jsonify(public), status
+
+
+@app.route("/api/switch_telegram/cancel", methods=["POST"])
+def api_switch_telegram_cancel():
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    data = request.get_json(silent=True) or {}
+    with _telegram_switch_lock:
+        outcome = _telegram_switch_auth.cancel(data.get("auth_attempt"))
+        if outcome.public.get("ok"):
+            _remove_telegram_session_artifacts(TG_SWITCH_SESSION_BASE)
+    return jsonify(outcome.public)
 
 @app.route("/api/status")
 def api_status():
@@ -1865,68 +2726,356 @@ def bf_is_running():
     except (OSError, ValueError):
         return False
 
-def wa_is_running():
-    """Verifica si el bot de WhatsApp está corriendo (por archivo PID)."""
-    pid_file = DATA_DIR / "wa_bot.pid"
+def _tracked_wa_pid(pid_file: Path) -> int | None:
     try:
-        if not pid_file.exists():
-            # Verificar si hay auth previa (carpeta wa_auth con datos)
-            if (DATA_DIR / "wa_auth").exists() and any((DATA_DIR / "wa_auth").iterdir()):
-                return False  # Auth exists but process dead
-            return None  # No vinculado aún
-        with open(pid_file, "r") as f:
-            pid = int(f.read().strip())
+        pid = int(pid_file.read_text(encoding="ascii").strip())
+        if pid <= 1 or pid == os.getpid():
+            return None
         os.kill(pid, 0)
-        return True
+        return pid
     except (OSError, ValueError):
-        return False
+        return None
 
-def restart_wa_bot():
-    """Reinicia el bot de WhatsApp matando el proceso node y relanzándolo."""
-    import subprocess, sys, time
-    
-    # Matar proceso existente por PID file
-    old_pid_file = DATA_DIR / "wa_bot.pid"
-    if old_pid_file.exists():
+
+def _is_wa_worker_pid(pid: int) -> bool:
+    if sys.platform != "win32":
         try:
-            with open(old_pid_file, "r") as f:
-                old_pid = int(f.read().strip())
-            os.kill(old_pid, 15)  # SIGTERM
-            time.sleep(1)
-            try:
-                os.kill(old_pid, 0)
-                os.kill(old_pid, 9)  # SIGKILL
-            except OSError:
-                pass
-        except (OSError, ValueError):
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "ignore")
+            return "wa_bot.mjs" in cmdline
+        except OSError:
+            return False
+    return "wa_bot.mjs" in _windows_process_command_line(pid).lower()
+
+
+def _wa_process_running(pid_file: Path) -> bool:
+    pid = _tracked_wa_pid(pid_file)
+    return bool(pid and _is_wa_worker_pid(pid))
+
+
+def _stop_wa_process(pid_file: Path) -> None:
+    pid = _tracked_wa_pid(pid_file)
+    if pid and _is_wa_worker_pid(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(20):
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.1)
+            else:
+                if sys.platform != "win32":
+                    os.kill(pid, signal.SIGKILL)
+        except OSError:
             pass
-    
-    # Lanzar nuevo proceso wa_bot.mjs
-    node = "node"
-    wa_script = str(BASE_DIR / "wa_bot.mjs")
-    log_file = "/tmp/bot_wa.log"
-    
-    with open(log_file, "a") as f:
-        f.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+    pid_file.unlink(missing_ok=True)
+
+
+def _start_wa_process(
+    *,
+    auth_dir: Path,
+    qr_file: Path,
+    health_file: Path,
+    identity_file: Path,
+    pid_file: Path,
+    link_only: bool,
+    log_name: str,
+) -> int | None:
+    _secure_directory(auth_dir)
+    health_file.unlink(missing_ok=True)
+    qr_file.unlink(missing_ok=True)
+    env = os.environ.copy()
+    env.update({
+        "WA_AUTH_DIR": str(auth_dir),
+        "WA_QR_PATH": str(qr_file),
+        "WA_HEALTH_FILE": str(health_file),
+        "WA_IDENTITY_FILE": str(identity_file),
+        "WA_LINK_ONLY": "1" if link_only else "0",
+        "WA_LINK_TIMEOUT_MS": str(WA_SWITCH_TIMEOUT_SECONDS * 1000),
+    })
+    log_path = Path("/tmp") / log_name
+    if sys.platform == "win32":
+        log_path = DATA_DIR / log_name
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    kwargs = {
+        "cwd": str(BASE_DIR),
+        "env": env,
+        "start_new_session": True,
+    }
+    if sys.platform == "win32":
+        kwargs.pop("start_new_session")
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+
+    with open(log_path, "a", encoding="utf-8") as log:
         proc = subprocess.Popen(
-            [node, wa_script],
-            stdout=f, stderr=subprocess.STDOUT,
-            cwd=BASE_DIR,
-            start_new_session=True
+            ["node", str(BASE_DIR / "wa_bot.mjs")],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            **kwargs,
         )
-        # Guardar PID
-        with open(old_pid_file, "w") as pf:
-            pf.write(str(proc.pid))
-    return proc.pid if proc else None
+    temporary_pid = pid_file.with_suffix(".tmp")
+    temporary_pid.parent.mkdir(parents=True, exist_ok=True)
+    temporary_pid.write_text(str(proc.pid), encoding="ascii")
+    os.replace(temporary_pid, pid_file)
+    time.sleep(0.75)
+    if proc.poll() is not None:
+        pid_file.unlink(missing_ok=True)
+        return None
+    return proc.pid
+
+
+def wa_is_running():
+    """Reporta disponibilidad real, no sólo la existencia de un proceso."""
+
+    pid_file = DATA_DIR / "wa_bot.pid"
+    if _wa_connection_open(pid_file, WA_CALL_HEALTH_FILE):
+        return True
+    if WA_AUTH_DIR.exists() and any(WA_AUTH_DIR.iterdir()):
+        return False
+    return None
+
+
+def _wa_connection_open(
+    pid_file: Path = DATA_DIR / "wa_bot.pid",
+    health_file: Path = WA_CALL_HEALTH_FILE,
+) -> bool:
+    return _wa_process_running(pid_file) and _read_wa_call_health(health_file).get("connection") == "open"
+
+
+def restart_wa_bot() -> int | None:
+    """Reinicia WhatsApp conservando íntegramente la cuenta vinculada."""
+
+    with _wa_process_lock:
+        pid_file = DATA_DIR / "wa_bot.pid"
+        _stop_wa_process(pid_file)
+        return _start_wa_process(
+            auth_dir=WA_AUTH_DIR,
+            qr_file=BASE_DIR / "wa_qr.png",
+            health_file=WA_CALL_HEALTH_FILE,
+            identity_file=WA_IDENTITY_FILE,
+            pid_file=pid_file,
+            link_only=False,
+            log_name="bot_wa.log",
+        )
+
+
+def _wa_switch_token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _load_wa_switch_operation() -> dict | None:
+    try:
+        parsed = json.loads(WA_SWITCH_OPERATION_FILE.read_text(encoding="utf-8"))
+        return parsed if isinstance(parsed, dict) else None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _save_wa_switch_operation(operation: dict) -> None:
+    _secure_directory(WA_SWITCH_DIR)
+    temporary = WA_SWITCH_OPERATION_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(operation, separators=(",", ":")), encoding="utf-8")
+    try:
+        os.chmod(temporary, 0o600)
+    except OSError:
+        pass
+    os.replace(temporary, WA_SWITCH_OPERATION_FILE)
+
+
+def _wa_switch_owned(operation: dict | None) -> bool:
+    token = session.get("wa_switch_token")
+    expected = operation.get("token_hash") if isinstance(operation, dict) else None
+    return bool(
+        isinstance(token, str)
+        and isinstance(expected, str)
+        and secrets.compare_digest(_wa_switch_token_digest(token), expected)
+    )
+
+
+def _cleanup_wa_switch_files() -> None:
+    _stop_wa_process(WA_SWITCH_PID_FILE)
+    if WA_SWITCH_DIR.exists():
+        shutil.rmtree(WA_SWITCH_DIR)
+
+
+def _cancel_wa_switch_expiry() -> None:
+    global _wa_switch_expiry_timer
+    if _wa_switch_expiry_timer is not None:
+        _wa_switch_expiry_timer.cancel()
+        _wa_switch_expiry_timer = None
+
+
+def _cleanup_wa_switch_candidate() -> None:
+    _cancel_wa_switch_expiry()
+    _cleanup_wa_switch_files()
+    session.pop("wa_switch_token", None)
+
+
+def _schedule_wa_switch_expiry(operation: dict) -> None:
+    """Detiene un QR abandonado aunque el navegador deje de consultar."""
+
+    global _wa_switch_expiry_timer
+    if _wa_switch_expiry_timer is not None:
+        _wa_switch_expiry_timer.cancel()
+    expected_hash = operation["token_hash"]
+    expected_started_at = operation["started_at"]
+
+    def expire() -> None:
+        global _wa_switch_expiry_timer
+        with _wa_switch_lock:
+            current = _load_wa_switch_operation()
+            if (
+                isinstance(current, dict)
+                and current.get("token_hash") == expected_hash
+                and current.get("started_at") == expected_started_at
+            ):
+                _cleanup_wa_switch_files()
+            _wa_switch_expiry_timer = None
+
+    timer = threading.Timer(WA_SWITCH_TIMEOUT_SECONDS, expire)
+    timer.daemon = True
+    _wa_switch_expiry_timer = timer
+    timer.start()
+
+
+def _reap_expired_wa_switch() -> None:
+    """Limpia staging vencido aunque Gunicorn se haya reiniciado."""
+
+    operation = _load_wa_switch_operation()
+    if not isinstance(operation, dict) or operation.get("status") == "recovery_required":
+        return
+    try:
+        expired = time.time() - float(operation.get("started_at", 0)) >= WA_SWITCH_TIMEOUT_SECONDS
+    except (TypeError, ValueError):
+        expired = True
+    if expired:
+        _cleanup_wa_switch_files()
+
+
+def _promote_wa_candidate() -> tuple[bool, str, dict, bool, bool]:
+    """Promueve la cuenta escaneada y restaura la anterior si no queda online."""
+
+    with _wa_switch_lock, _wa_process_lock:
+        operation = _load_wa_switch_operation()
+        if not _wa_switch_owned(operation):
+            return False, "El intento de cambio ya no pertenece a este navegador.", {}, True, _wa_connection_open()
+        if operation.get("status") == "recovery_required" or _whatsapp_recovery_pending():
+            return False, "Hay un respaldo pendiente de recuperación manual.", {}, True, _wa_connection_open()
+        if not _wa_connection_open(WA_SWITCH_PID_FILE, WA_SWITCH_HEALTH_FILE):
+            return False, "La cuenta nueva todavía no está conectada.", {}, True, _wa_connection_open()
+        if not WA_SWITCH_AUTH_DIR.exists() or not any(WA_SWITCH_AUTH_DIR.iterdir()):
+            return False, "WhatsApp no guardó la nueva sesión.", {}, True, _wa_connection_open()
+
+        candidate_identity = _read_safe_identity(WA_SWITCH_IDENTITY_FILE)
+        rollback_auth = WA_SWITCH_DIR / "rollback_auth"
+        rollback_state = WA_SWITCH_DIR / "rollback_interaction_state.json"
+        rollback_identity = WA_SWITCH_DIR / "rollback_identity.json"
+        current_state = DATA_DIR / "wa_interaction_state.json"
+        current_pid = DATA_DIR / "wa_bot.pid"
+        current_qr = BASE_DIR / "wa_qr.png"
+        old_was_running = _wa_process_running(current_pid)
+
+        _stop_wa_process(WA_SWITCH_PID_FILE)
+        _stop_wa_process(current_pid)
+        try:
+            if rollback_auth.exists():
+                shutil.rmtree(rollback_auth)
+            if WA_AUTH_DIR.exists():
+                os.replace(WA_AUTH_DIR, rollback_auth)
+            if current_state.exists():
+                os.replace(current_state, rollback_state)
+            if WA_IDENTITY_FILE.exists():
+                os.replace(WA_IDENTITY_FILE, rollback_identity)
+            os.replace(WA_SWITCH_AUTH_DIR, WA_AUTH_DIR)
+            if WA_SWITCH_IDENTITY_FILE.exists():
+                os.replace(WA_SWITCH_IDENTITY_FILE, WA_IDENTITY_FILE)
+            WA_CALL_HEALTH_FILE.unlink(missing_ok=True)
+            current_qr.unlink(missing_ok=True)
+            started = restart_wa_bot()
+            if not started or not _wait_until(_wa_connection_open, 15):
+                raise RuntimeError("new_wa_worker_not_ready")
+        except Exception:
+            restored = True
+            try:
+                _stop_wa_process(current_pid)
+                if WA_AUTH_DIR.exists():
+                    shutil.rmtree(WA_AUTH_DIR)
+                if rollback_auth.exists():
+                    os.replace(rollback_auth, WA_AUTH_DIR)
+                current_state.unlink(missing_ok=True)
+                if rollback_state.exists():
+                    os.replace(rollback_state, current_state)
+                WA_IDENTITY_FILE.unlink(missing_ok=True)
+                if rollback_identity.exists():
+                    os.replace(rollback_identity, WA_IDENTITY_FILE)
+            except Exception:
+                restored = False
+
+            old_ready = False
+            if restored and old_was_running and WA_AUTH_DIR.exists():
+                try:
+                    started = restart_wa_bot()
+                    old_ready = bool(started and _wait_until(_wa_connection_open, 15))
+                except Exception:
+                    old_ready = False
+
+            if restored:
+                _cleanup_wa_switch_candidate()
+                message = (
+                    "No se pudo activar la cuenta nueva; la anterior fue restaurada."
+                    if old_ready
+                    else "La cuenta anterior fue restaurada, pero su servicio no quedó en línea."
+                )
+            else:
+                recovery_dir = WA_SWITCH_RECOVERY_ROOT / (
+                    f"{int(time.time())}-{secrets.token_hex(4)}"
+                )
+                recovery_saved = False
+                try:
+                    recovery_dir.mkdir(parents=True, exist_ok=False)
+                    try:
+                        os.chmod(WA_SWITCH_RECOVERY_ROOT, 0o700)
+                        os.chmod(recovery_dir, 0o700)
+                    except OSError:
+                        pass
+                    for artifact in (rollback_auth, rollback_state, rollback_identity):
+                        if artifact.exists():
+                            os.replace(artifact, recovery_dir / artifact.name)
+                    recovery_saved = any(recovery_dir.iterdir())
+                except Exception:
+                    recovery_saved = False
+                if recovery_saved:
+                    _cleanup_wa_switch_candidate()
+                    message = (
+                        "Falló la activación y la restauración automática. "
+                        "El respaldo disponible se conservó para recuperación manual."
+                    )
+                else:
+                    _cancel_wa_switch_expiry()
+                    _stop_wa_process(WA_SWITCH_PID_FILE)
+                    operation["status"] = "recovery_required"
+                    _save_wa_switch_operation(operation)
+                    message = (
+                        "Falló la activación y no fue posible mover el respaldo. "
+                        "Los archivos de recuperación permanecen en el directorio de cambio."
+                    )
+            return False, message, {}, restored, old_ready
+
+        if rollback_auth.exists():
+            shutil.rmtree(rollback_auth, ignore_errors=True)
+        rollback_state.unlink(missing_ok=True)
+        rollback_identity.unlink(missing_ok=True)
+        _cleanup_wa_switch_candidate()
+        session["wa_admin"] = True
+        session.permanent = True
+        return True, "Cuenta de WhatsApp cambiada y verificada.", candidate_identity, True, True
 
 @app.route("/api/restart_bot", methods=["POST"])
 def api_restart_bot():
     """Reinicia el worker rastreado y no devuelve logs internos."""
-    if not session.get("telegram_admin"):
-        return jsonify({
-            "ok": False,
-            "error": "Esta acción requiere el navegador que vinculó Telegram.",
-        }), 403
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
     try:
         started, message = restart_telegram_worker()
         status = 200 if started else 409
@@ -1936,40 +3085,244 @@ def api_restart_bot():
 
 @app.route("/api/restart_wa_bot", methods=["POST"])
 def api_restart_wa_bot():
-    """Reinicia el bot de WhatsApp."""
+    """Reinicia el servicio sin borrar la cuenta vinculada."""
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
     try:
         pid = restart_wa_bot()
-        return jsonify({"ok": True, "message": "WA Bot reiniciado", "pid": pid})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        if not pid:
+            return jsonify({"ok": False, "error": "WhatsApp no pudo iniciar."}), 503
+        return jsonify({"ok": True, "message": "WhatsApp reiniciado sin cambiar la cuenta."})
+    except Exception:
+        return jsonify({"ok": False, "error": "No fue posible reiniciar WhatsApp."}), 500
 
 
 @app.route("/api/reset_wa", methods=["POST"])
 def api_reset_wa():
-    """Borra la sesión de WhatsApp para forzar un QR nuevo."""
-    import shutil
-    
-    # Matar proceso WA existente
-    old_pid_file = DATA_DIR / "wa_bot.pid"
-    if old_pid_file.exists():
-        try:
-            with open(old_pid_file, "r") as f:
-                old_pid = int(f.read().strip())
-            os.kill(old_pid, 9)
-        except:
-            pass
-        old_pid_file.unlink(missing_ok=True)
-    
-    # Borrar sesión
-    wa_auth_dir = DATA_DIR / "wa_auth"
-    if wa_auth_dir.exists():
-        shutil.rmtree(str(wa_auth_dir), ignore_errors=True)
-    wa_auth_dir.mkdir(parents=True, exist_ok=True)
-    # También borrar QR viejo
-    qr_path = BASE_DIR / "wa_qr.png"
-    if qr_path.exists():
-        qr_path.unlink()
-    return jsonify({"ok": True, "message": "Sesión WA eliminada"})
+    """El reset destructivo fue sustituido por el cambio transaccional."""
+    return jsonify({
+        "ok": False,
+        "error_code": "use_transactional_switch",
+        "error": "Usa «Cambiar cuenta» para conservar la sesión anterior hasta verificar la nueva.",
+    }), 410
+
+
+@app.route("/api/switch_wa", methods=["POST"])
+def api_switch_wa():
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    data = request.get_json(silent=True) or {}
+    if data.get("confirm") is not True:
+        return jsonify({"ok": False, "error": "Confirma el cambio de cuenta."}), 400
+
+    with _wa_switch_lock:
+        _reap_expired_wa_switch()
+        existing = _load_wa_switch_operation()
+        if _whatsapp_recovery_pending() or (
+            existing and existing.get("status") == "recovery_required"
+        ):
+            return jsonify({
+                "ok": False,
+                "error_code": "recovery_required",
+                "error": "Hay un respaldo pendiente de recuperación manual; no se inició otro cambio.",
+            }), 409
+        if existing and time.time() - float(existing.get("started_at", 0)) < WA_SWITCH_TIMEOUT_SECONDS:
+            return jsonify({
+                "ok": False,
+                "error_code": "switch_in_progress",
+                "error": "Ya hay un cambio de WhatsApp en curso.",
+            }), 409
+        _cleanup_wa_switch_candidate()
+        _secure_directory(WA_SWITCH_AUTH_DIR)
+        token = secrets.token_urlsafe(32)
+        operation = {
+            "version": 1,
+            "token_hash": _wa_switch_token_digest(token),
+            "started_at": time.time(),
+            "status": "preparing",
+        }
+        _save_wa_switch_operation(operation)
+        _schedule_wa_switch_expiry(operation)
+        session["wa_switch_token"] = token
+        session.permanent = True
+        pid = _start_wa_process(
+            auth_dir=WA_SWITCH_AUTH_DIR,
+            qr_file=WA_SWITCH_QR_FILE,
+            health_file=WA_SWITCH_HEALTH_FILE,
+            identity_file=WA_SWITCH_IDENTITY_FILE,
+            pid_file=WA_SWITCH_PID_FILE,
+            link_only=True,
+            log_name="bot_wa_switch.log",
+        )
+        if not pid:
+            _cleanup_wa_switch_candidate()
+            return jsonify({"ok": False, "error": "No fue posible preparar el QR."}), 503
+    return jsonify({"ok": True, "state": "preparing"}), 202
+
+
+@app.route("/api/switch_wa/status")
+def api_switch_wa_status():
+    if not _can_manage_channels():
+        return jsonify({"ok": False, "error": "Sesión administrativa requerida."}), 403
+    with _wa_switch_lock:
+        operation = _load_wa_switch_operation()
+        if not _wa_switch_owned(operation):
+            return jsonify({"ok": False, "error": "No hay un cambio activo en este navegador."}), 404
+        if operation.get("status") == "recovery_required":
+            return jsonify({
+                "ok": False,
+                "state": "recovery_required",
+                "error": "La recuperación automática no terminó; el respaldo sigue conservado.",
+            }), 503
+        if time.time() - float(operation.get("started_at", 0)) >= WA_SWITCH_TIMEOUT_SECONDS:
+            _cleanup_wa_switch_candidate()
+            return jsonify({"ok": False, "state": "expired", "error": "El QR venció; inicia otro cambio."}), 410
+
+        if _wa_connection_open(WA_SWITCH_PID_FILE, WA_SWITCH_HEALTH_FILE):
+            return jsonify({
+                "ok": True,
+                "state": "scanned",
+                "ready_to_commit": True,
+            })
+        if not _wa_process_running(WA_SWITCH_PID_FILE):
+            _cleanup_wa_switch_candidate()
+            return jsonify({
+                "ok": False,
+                "state": "failed",
+                "error": "El emparejamiento se detuvo; la cuenta anterior sigue activa.",
+            }), 503
+        return jsonify({
+            "ok": True,
+            "state": "awaiting_qr" if WA_SWITCH_QR_FILE.is_file() else "preparing",
+            "qr_ready": WA_SWITCH_QR_FILE.is_file(),
+        })
+
+
+@app.route("/api/switch_wa/commit", methods=["POST"])
+def api_switch_wa_commit():
+    """Promueve exactamente una vez la cuenta candidata ya verificada."""
+
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    with _wa_switch_lock:
+        operation = _load_wa_switch_operation()
+        if not _wa_switch_owned(operation):
+            return jsonify({"ok": False, "error": "No hay un cambio activo en este navegador."}), 404
+        if operation.get("status") == "recovery_required" or _whatsapp_recovery_pending():
+            return jsonify({
+                "ok": False,
+                "error_code": "recovery_required",
+                "error": "Hay un respaldo pendiente de recuperación manual.",
+            }), 409
+        if not _wa_connection_open(WA_SWITCH_PID_FILE, WA_SWITCH_HEALTH_FILE):
+            return jsonify({
+                "ok": False,
+                "error_code": "candidate_not_ready",
+                "error": "La cuenta nueva todavía no terminó de vincularse.",
+            }), 409
+        switched, message, identity, previous_preserved, previous_ready = _promote_wa_candidate()
+    status = 200 if switched else 503
+    return jsonify({
+        "ok": switched,
+        "state": "ready" if switched else (
+            "rollback_restored" if previous_preserved else "recovery_required"
+        ),
+        "message": message,
+        "identity": identity if switched else None,
+        **({} if switched else {
+            "error": message,
+            "previous_account_preserved": previous_preserved,
+            "previous_worker_ready": previous_ready,
+        }),
+    }), status
+
+
+@app.route("/api/switch_wa/qr")
+def api_switch_wa_qr():
+    if not _can_manage_channels():
+        return jsonify({"ok": False, "error": "Sesión administrativa requerida."}), 403
+    operation = _load_wa_switch_operation()
+    if not _wa_switch_owned(operation) or not WA_SWITCH_QR_FILE.is_file():
+        return jsonify({"ok": False, "error": "QR no disponible."}), 404
+    response = send_from_directory(str(WA_SWITCH_DIR), WA_SWITCH_QR_FILE.name)
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@app.route("/api/switch_wa/cancel", methods=["POST"])
+def api_switch_wa_cancel():
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    with _wa_switch_lock:
+        operation = _load_wa_switch_operation()
+        if not _wa_switch_owned(operation):
+            return jsonify({"ok": False, "error": "No hay un cambio activo en este navegador."}), 404
+        if operation.get("status") == "recovery_required":
+            return jsonify({
+                "ok": False,
+                "error_code": "recovery_required",
+                "error": "No se eliminó el respaldo pendiente de recuperación.",
+            }), 409
+        _cleanup_wa_switch_candidate()
+    return jsonify({"ok": True, "message": "Cambio cancelado; la cuenta anterior sigue activa."})
+
+
+@app.route("/api/channels")
+def api_channels():
+    """Resumen seguro para la UX de vinculación y cambio de cuentas."""
+
+    can_manage = _can_manage_channels()
+    tg_authorized = _telegram_session_is_authorized()
+    tg_ready = bot_is_running()
+    tg_identity = _read_safe_identity(DATA_DIR / "tg_identity.json")
+    tg_phone = os.environ.get("TG_PHONE") or _read_env_var("TG_PHONE")
+
+    wa_auth_present = WA_AUTH_DIR.exists() and any(WA_AUTH_DIR.iterdir())
+    wa_worker_running = _wa_process_running(DATA_DIR / "wa_bot.pid")
+    wa_ready = _wa_connection_open()
+    wa_health = _read_wa_call_health()
+    wa_identity = _read_safe_identity(WA_IDENTITY_FILE)
+    with _wa_switch_lock:
+        _reap_expired_wa_switch()
+        wa_operation = _load_wa_switch_operation()
+    wa_switching = bool(wa_operation and _wa_switch_owned(wa_operation))
+    tg_recovery_required = _telegram_recovery_pending()
+    wa_recovery_required = _whatsapp_recovery_pending() or bool(
+        wa_operation and wa_operation.get("status") == "recovery_required"
+    )
+
+    return jsonify({
+        "ok": True,
+        "csrf": _channel_csrf_token(),
+        "can_manage": can_manage,
+        "telegram": {
+            "linked": tg_authorized,
+            "ready": tg_ready,
+            "state": "recovery_required" if tg_recovery_required else (
+                "ready" if tg_ready else ("offline" if tg_authorized else "unlinked")
+            ),
+            "display_name": tg_identity.get("display_name") if tg_authorized and can_manage else None,
+            "username": tg_identity.get("username") if tg_authorized and can_manage else None,
+            "phone_hint": _mask_phone(tg_phone) if tg_authorized and can_manage else None,
+        },
+        "whatsapp": {
+            "linked": wa_auth_present,
+            "ready": wa_ready,
+            "worker_running": wa_worker_running,
+            "state": "recovery_required" if wa_recovery_required else "switching" if wa_switching else (
+                "ready" if wa_ready else ("offline" if wa_auth_present else "unlinked")
+            ),
+            "display_name": wa_identity.get("display_name") if wa_auth_present and can_manage else None,
+            "phone_hint": wa_identity.get("phone_hint") if wa_auth_present and can_manage else None,
+            "reauth_required": wa_health.get("reauth_required", False) if can_manage else False,
+        },
+    })
 
 
 @app.route("/api/start_botfather", methods=["POST"])

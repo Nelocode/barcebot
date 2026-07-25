@@ -192,6 +192,28 @@ class TelegramAuthTestCase(unittest.TestCase):
         self.assertGreaterEqual(len(client.loop_ids), 6)
         self.assertEqual(1, client.disconnect_count)
 
+    def test_has_pending_tracks_only_an_active_challenge(self):
+        client = FakeClient()
+        manager = self.make_manager(client)
+
+        self.assertFalse(manager.has_pending())
+        begun = manager.begin(self.API_ID, self.API_HASH, self.PHONE)
+        self.assertTrue(manager.has_pending())
+        manager.verify_code(self.CODE, begun.attempt_token)
+        self.assertFalse(manager.has_pending())
+
+    def test_expiry_callback_disconnects_an_abandoned_challenge(self):
+        client = FakeClient()
+        manager = self.make_manager(client)
+        begun = manager.begin(self.API_ID, self.API_HASH, self.PHONE)
+        manager._pending["expires_at"] = time.monotonic() - 1
+
+        manager._submit(manager._expire_pending(begun.attempt_token))
+
+        self.assertFalse(manager.has_pending())
+        self.assertFalse(client.connected)
+        self.assertEqual(1, client.disconnect_count)
+
     def test_pending_survives_code_step_until_2fa_finishes_on_same_loop(self):
         client = FakeClient(require_password=True)
         manager = self.make_manager(client)
