@@ -1,5 +1,8 @@
+import os
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from telethon.tl import types
 
@@ -8,10 +11,89 @@ from telegram_audio_branding import (
     AUDIO_TITLE,
     brand_audio_attributes,
     build_branded_audio_media,
+    resolve_audio_branding,
+    resolve_audio_cover_path,
 )
 
 
 class TelegramAudioBrandingTests(unittest.TestCase):
+    def setUp(self):
+        self.branding_environment = patch.dict(
+            os.environ,
+            {
+                "TG_AUDIO_TITLE": "",
+                "TG_AUDIO_PERFORMER": "",
+                "TG_AUDIO_COVER_PATH": "",
+            },
+        )
+        self.branding_environment.start()
+
+    def tearDown(self):
+        self.branding_environment.stop()
+
+    def test_madrid_branding_remains_the_default(self):
+        title, performer = resolve_audio_branding(environ={})
+
+        self.assertEqual("Las Fiesteras", title)
+        self.assertEqual("Caché Madrid", performer)
+
+    def test_barcelona_branding_can_be_selected_per_deployment(self):
+        with patch.dict(
+            os.environ,
+            {
+                "TG_AUDIO_TITLE": "Las Fiesteras",
+                "TG_AUDIO_PERFORMER": "Caché Barcelona",
+            },
+        ):
+            branded = brand_audio_attributes([], filename="fr_msg1.mp3")
+
+        audio = next(
+            item for item in branded
+            if isinstance(item, types.DocumentAttributeAudio)
+        )
+        self.assertEqual("Las Fiesteras", audio.title)
+        self.assertEqual("Caché Barcelona", audio.performer)
+
+    def test_blank_branding_variables_fall_back_to_madrid(self):
+        with patch.dict(
+            os.environ,
+            {
+                "TG_AUDIO_TITLE": "   ",
+                "TG_AUDIO_PERFORMER": "   ",
+            },
+        ):
+            title, performer = resolve_audio_branding()
+
+        self.assertEqual(AUDIO_TITLE, title)
+        self.assertEqual(AUDIO_PERFORMER, performer)
+
+    def test_cover_path_is_isolated_per_deployment(self):
+        base_dir = Path("/app")
+        self.assertEqual(
+            base_dir / "assets" / "audio-cover.jpg",
+            resolve_audio_cover_path(base_dir, environ={}),
+        )
+
+        with patch.dict(
+            os.environ,
+            {"TG_AUDIO_COVER_PATH": "assets/audio-cover-barcelona.jpg"},
+        ):
+            self.assertEqual(
+                base_dir / "assets" / "audio-cover-barcelona.jpg",
+                resolve_audio_cover_path(base_dir),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            absolute_cover = Path(directory) / "barcelona.jpg"
+            with patch.dict(
+                os.environ,
+                {"TG_AUDIO_COVER_PATH": str(absolute_cover)},
+            ):
+                self.assertEqual(
+                    absolute_cover,
+                    resolve_audio_cover_path(base_dir),
+                )
+
     def test_preserves_duration_and_filename_while_enforcing_brand(self):
         attributes = [
             types.DocumentAttributeFilename(file_name="es_msg2.mp3"),
