@@ -6,6 +6,7 @@ import unittest
 from telethon.tl import functions, types
 
 from telegram_events import (
+    incoming_call_discard_request,
     missed_call_search_request,
     missed_call_interaction,
     new_message_interaction,
@@ -106,6 +107,38 @@ class TelegramEventExtractionTests(unittest.TestCase):
 
         self.assertEqual("call:701", result.event_id)
         self.assertIs(peer, result.reply_peer)
+
+    def test_incoming_call_builds_busy_discard_request(self):
+        protocol = types.PhoneCallProtocol(
+            min_layer=65,
+            max_layer=92,
+            library_versions=["test"],
+        )
+        incoming = types.UpdatePhoneCall(types.PhoneCallWaiting(
+            video=True,
+            id=702,
+            access_hash=987654,
+            date=None,
+            admin_id=123,
+            participant_id=999,
+            protocol=protocol,
+        ))
+
+        request = incoming_call_discard_request(incoming, self_user_id=999)
+
+        self.assertIsInstance(request, functions.phone.DiscardCallRequest)
+        self.assertEqual((702, 987654), (request.peer.id, request.peer.access_hash))
+        self.assertIsInstance(request.reason, types.PhoneCallDiscardReasonBusy)
+        self.assertEqual(0, request.duration)
+        self.assertEqual(0, request.connection_id)
+        self.assertTrue(request.video)
+        self.assertIsNone(
+            incoming_call_discard_request(incoming, self_user_id=123)
+        )
+        incoming.phone_call.access_hash = None
+        self.assertIsNone(
+            incoming_call_discard_request(incoming, self_user_id=999)
+        )
 
     def test_missed_call_service_uses_same_call_event_id_for_dedupe(self):
         service = types.MessageService(

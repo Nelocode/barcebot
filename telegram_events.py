@@ -108,6 +108,25 @@ def requested_call_interaction(
         reply_peer=reply_peer,
     )
 
+
+def incoming_call_discard_request(update, *, self_user_id: int | None):
+    """Build a refusal request only for a genuine incoming one-to-one call."""
+
+    if requested_call_interaction(update, self_user_id=self_user_id) is None:
+        return None
+    phone_call = update.phone_call
+    call_id = getattr(phone_call, "id", None)
+    access_hash = getattr(phone_call, "access_hash", None)
+    if not isinstance(call_id, int) or not isinstance(access_hash, int):
+        return None
+    return functions.phone.DiscardCallRequest(
+        peer=types.InputPhoneCall(id=call_id, access_hash=access_hash),
+        duration=0,
+        reason=types.PhoneCallDiscardReasonBusy(),
+        connection_id=0,
+        video=bool(getattr(phone_call, "video", False)),
+    )
+
 def missed_call_interaction(
     update,
     *,

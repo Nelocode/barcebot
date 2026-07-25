@@ -21,13 +21,15 @@ import time
 from types import SimpleNamespace
 import uuid
 
-from telethon import TelegramClient, events, utils
+from telethon import TelegramClient, errors, events, utils
 from telethon.tl import types
 
 from interaction_state import PersistentInteractionState
 from message_schema import load_message_file
+from telegram_call_rejection import TelegramCallRejectCoordinator
 from telegram_events import (
     PHONE_CALL_SUBTYPES,
+    incoming_call_discard_request,
     missed_call_search_request,
     missed_call_interaction,
     new_message_interaction,
@@ -55,6 +57,9 @@ INTERACTION_STATE_FILE = DATA_DIR / "tg_interaction_state.json"
 INTERACTION_HEALTH_FILE = DATA_DIR / "tg_interaction_health.json"
 TELEGRAM_SEND_TIMEOUT_SECONDS = 20
 TELEGRAM_SEND_RETRIES = 3
+TELEGRAM_CALL_REJECT_TIMEOUT_SECONDS = 6
+TELEGRAM_CALL_REJECT_SETTLE_SECONDS = 0.5
+RECENT_CALL_REJECTION_LIMIT = 256
 
 
 def _load_env_file() -> None:
@@ -198,6 +203,9 @@ def get_response_message(language: str, response_key: str) -> tuple[str, str]:
 
 client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 self_user_id: int | None = None
+call_reject_coordinator = TelegramCallRejectCoordinator(
+    limit=RECENT_CALL_REJECTION_LIMIT,
+)
 interaction_health = {
     "schema_version": 1,
     "worker_revision": str(uuid.uuid4()),
@@ -205,6 +213,8 @@ interaction_health = {
     "raw_phone_revision": None,
     "phone_subtype": "never",
     "phone_revisions": {subtype: None for subtype in PHONE_CALL_SUBTYPES},
+    "call_reject_revision": None,
+    "call_reject_status": "never",
     "service_call_revision": None,
     "service_call_status": "never",
     "service_peer_source": "never",
@@ -240,6 +250,47 @@ def update_delivery_health(stage: str, state: str) -> None:
     delivery = dict(interaction_health["delivery"])
     delivery[stage] = state
     update_interaction_health(delivery=delivery)
+
+
+async def reject_incoming_call(update) -> str:
+    """Reject one incoming call while duplicate updates share the same RPC."""
+
+    request = incoming_call_discard_request(update, self_user_id=self_user_id)
+    if request is None:
+        return "not_incoming"
+
+    async def discard() -> str:
+        update_interaction_health(
+            call_reject_revision=str(uuid.uuid4()),
+            call_reject_status="pending",
+        )
+        try:
+            await asyncio.wait_for(
+                client(request),
+                timeout=TELEGRAM_CALL_REJECT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            status = "timed_out"
+        except (
+            errors.CallAlreadyAcceptedError,
+            errors.CallAlreadyDeclinedError,
+            errors.CallPeerInvalidError,
+        ):
+            status = "already_finished"
+        except (errors.RPCError, OSError):
+            status = "failed"
+        except Exception as exc:
+            logging.warning("Telegram call rejection failed (%s)", type(exc).__name__)
+            status = "failed"
+        else:
+            status = "sent"
+
+        update_interaction_health(call_reject_status=status)
+        if status == "sent":
+            await asyncio.sleep(TELEGRAM_CALL_REJECT_SETTLE_SECONDS)
+        return status
+
+    return await call_reject_coordinator.execute(request.peer.id, discard)
 
 
 def write_health(ready: bool) -> None:
@@ -454,6 +505,7 @@ async def handle_phone_call(update) -> None:
     interaction = requested_call_interaction(update, self_user_id=self_user_id)
     if not interaction:
         return
+    await reject_incoming_call(update)
     reply_peer, peer_source = await resolve_reply_peer(
         client,
         update,

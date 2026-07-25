@@ -354,6 +354,8 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
                     "discarded": "00000000-0000-4000-8000-000000000005",
                     "caller": secret_id,
                 },
+                "call_reject_revision": "00000000-0000-4000-8000-000000000006",
+                "call_reject_status": "sent",
                 "service_call_status": "processed",
                 "service_peer_source": "update_entities",
                 "missed_call_poll": "healthy",
@@ -389,6 +391,11 @@ class AccountSwitchRoutesTestCase(unittest.TestCase):
             data["phone_revisions"]["discarded"],
         )
         self.assertNotIn("caller", data["phone_revisions"])
+        self.assertEqual("sent", data["call_reject_status"])
+        self.assertEqual(
+            "00000000-0000-4000-8000-000000000006",
+            data["call_reject_revision"],
+        )
         self.assertEqual("processed", data["service_call_status"])
         self.assertEqual("update_entities", data["service_peer_source"])
         self.assertEqual("healthy", data["missed_call_poll"])

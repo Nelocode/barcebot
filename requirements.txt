@@ -1,5 +1,5 @@
 flask>=3.0
 gunicorn>=21.2
-telethon>=1.36
+telethon>=1.44,<2
 cryptg>=0.4
 python-telegram-bot>=21.0

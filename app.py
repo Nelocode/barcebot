@@ -2067,6 +2067,8 @@ def _read_tg_interaction_health() -> dict:
                 "discarded", "empty", "other",
             )
         },
+        "call_reject_revision": None,
+        "call_reject_status": "never",
         "service_call_revision": None,
         "service_call_status": "never",
         "service_peer_source": "never",
@@ -2095,7 +2097,12 @@ def _read_tg_interaction_health() -> dict:
         {"starting", "connecting", "open", "closed", "unknown"},
         "unknown",
     )
-    for key in ("raw_phone_revision", "service_call_revision", "classified_revision"):
+    for key in (
+        "raw_phone_revision",
+        "call_reject_revision",
+        "service_call_revision",
+        "classified_revision",
+    ):
         result[key] = _safe_uuid(raw.get(key))
     result["phone_subtype"] = _safe_enum(
         raw.get("phone_subtype"),
@@ -2114,6 +2121,14 @@ def _read_tg_interaction_health() -> dict:
         key: _safe_uuid(raw_phone_revisions.get(key))
         for key in result["phone_revisions"]
     }
+    result["call_reject_status"] = _safe_enum(
+        raw.get("call_reject_status"),
+        {
+            "never", "pending", "sent", "duplicate", "already_finished",
+            "timed_out", "failed",
+        },
+        "failed",
+    )
     result["service_call_status"] = _safe_enum(
         raw.get("service_call_status"),
         {"never", "seen", "ignored", "classified", "delivery_failed", "processed"},
