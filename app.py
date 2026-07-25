@@ -5,8 +5,17 @@ Flask webapp para gestionar mensajes y audios del bot.
 import os
 import json
 import shutil
+import re
+import secrets
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import timedelta
 from pathlib import Path
-from flask import Flask, render_template_string, request, jsonify, send_from_directory
+from flask import Flask, render_template_string, request, jsonify, send_from_directory, session
+from telegram_auth import TelegramAuthManager
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -14,15 +23,42 @@ AUDIO_DIR = DATA_DIR / "audios"
 MESSAGES_FILE = DATA_DIR / "messages.json"
 WA_CALL_HEALTH_FILE = DATA_DIR / "wa_call_health.json"
 
+def _load_or_create_flask_secret() -> str:
+    configured = os.environ.get("FLASK_SECRET")
+    if configured and len(configured) >= 32:
+        return configured
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    secret_file = DATA_DIR / ".flask_secret"
+    try:
+        saved = secret_file.read_text(encoding="ascii").strip()
+        if len(saved) >= 64:
+            return saved
+    except OSError:
+        pass
+    generated = secrets.token_hex(32)
+    temp = secret_file.with_suffix(".tmp")
+    temp.write_text(generated, encoding="ascii")
+    try:
+        os.chmod(temp, 0o600)
+    except OSError:
+        pass
+    os.replace(temp, secret_file)
+    return generated
+
+
 app = Flask(__name__)
-APP_SECRET = os.environ.get("FLASK_SECRET", "bot-autoreply-secret-change-me")
+APP_SECRET = _load_or_create_flask_secret()
 app.secret_key = APP_SECRET
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "1") != "0",
+)
+app.permanent_session_lifetime = timedelta(days=365)
 
 # ── Telethon auth state (para flujo interactivo desde el panel) ──────
-# Guarda el estado entre send_code_request y sign_in
-import asyncio as _asyncio
-_pending_auth: dict = {}  # {phone_code_hash, client, phone}
-_telethon_client = None
+# Conserva un solo event loop entre send_code_request, sign_in y 2FA.
+_telegram_auth = TelegramAuthManager(str(DATA_DIR / "tg_session"))
 
 # ── HTML Template (todo en uno para portabilidad) ───────────────────
 TEMPLATE = r"""<!DOCTYPE html>
@@ -114,23 +150,23 @@ label { color: #c8c8e0 !important; font-weight: 500; }
           <input id="tg-api-id" type="number" class="form-control form-control-sm" placeholder="api_id" style="font-family:monospace;font-size:0.8rem;">
         </div>
         <div class="col-5">
-          <input id="tg-api-hash" type="text" class="form-control form-control-sm" placeholder="api_hash" style="font-family:monospace;font-size:0.8rem;">
+          <input id="tg-api-hash" type="password" autocomplete="new-password" class="form-control form-control-sm" placeholder="api_hash" style="font-family:monospace;font-size:0.8rem;">
         </div>
         <div class="col-4">
           <input id="tg-phone" type="text" class="form-control form-control-sm" placeholder="+57 300 123 4567" style="font-family:monospace;font-size:0.8rem;">
         </div>
       </div>
       <div class="d-flex align-items-center gap-2 mb-2">
-        <button class="btn btn-sm btn-primary" onclick="linkTelegram()">🔗 Vincular</button>
+        <button id="tg-link-btn" class="btn btn-sm btn-primary" onclick="linkTelegram()">🔗 Vincular</button>
       </div>
       <div id="tg-link-status" class="small text-muted mb-3"></div>
 
       <!-- ── Código de verificación TG (oculto hasta que se necesite) ── -->
       <div id="tg-code-section" style="display:none;" class="mb-3 p-2" >
         <h6 class="mb-1">📨 Código de verificación</h6>
-        <p class="small text-muted mb-2">Revisa Telegram en el número <strong id="tg-code-phone"></strong>. Te llegó un mensaje con un código de 5 dígitos.</p>
+        <p id="tg-code-help" class="small text-muted mb-2">Revisa el canal que Telegram indicó y escribe aquí el código más reciente.</p>
         <div class="d-flex gap-2">
-          <input id="tg-code-input" type="text" class="form-control form-control-sm" placeholder="12345" maxlength="10" style="font-family:monospace;font-size:1.1rem;letter-spacing:4px;text-align:center;flex:1;">
+          <input id="tg-code-input" type="text" class="form-control form-control-sm" placeholder="Código" maxlength="32" style="font-family:monospace;font-size:1.1rem;letter-spacing:4px;text-align:center;flex:1;">
           <button class="btn btn-sm btn-success" onclick="verifyTgCode()">✅ Verificar</button>
           <button class="btn btn-sm btn-outline-light" onclick="cancelTgAuth()">✕ Cancelar</button>
         </div>
@@ -644,11 +680,15 @@ function showSetup() {
   document.getElementById("tg-code-section").style.display = 'none';
   fetch("/api/tg_status").then(r => r.json()).then(d => {
     const el = document.getElementById("tg-link-status");
-    if (d.linked) {
-      el.innerHTML = '✅ <strong>Vinculado</strong> como ' + (d.display_name || 'usuario');
+    if (d.ready) {
+      el.innerHTML = '✅ <strong>Vinculado y en línea</strong>';
       document.getElementById("tg-api-id").placeholder = 'Ya configurado';
       document.getElementById("tg-api-hash").placeholder = 'Ya configurado';
-      document.getElementById("tg-phone").placeholder = d.phone || 'Ya configurado';
+      document.getElementById("tg-phone").placeholder = 'Ya configurado';
+    } else if (d.linked) {
+      el.innerHTML = '⚠️ <strong>Sesión autorizada, proceso fuera de línea.</strong> Pulsa Reiniciar TG.';
+    } else if (d.configured) {
+      el.innerHTML = '⚠️ Las credenciales existen, pero falta verificar la sesión.';
     } else {
       el.innerHTML = '⚠️ Sin vincular. Ingresa api_id, api_hash y número de teléfono.';
     }
@@ -665,6 +705,32 @@ function showSetup() {
   }).catch(() => {});
 }
 
+let tgRetryTimer = null;
+let tgAuthAttempt = sessionStorage.getItem("tg_auth_attempt") || null;
+function armTgRetry(seconds) {
+  const btn = document.getElementById("tg-link-btn");
+  let remaining = Math.max(0, Number(seconds) || 0);
+  if (tgRetryTimer) clearInterval(tgRetryTimer);
+  if (remaining <= 0) {
+    btn.disabled = false;
+    btn.innerHTML = '🔗 Solicitar otro código';
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = `Espera ${remaining}s`;
+  tgRetryTimer = setInterval(() => {
+    remaining -= 1;
+    if (remaining <= 0) {
+      clearInterval(tgRetryTimer);
+      tgRetryTimer = null;
+      btn.disabled = false;
+      btn.innerHTML = '🔗 Solicitar otro código';
+    } else {
+      btn.textContent = `Espera ${remaining}s`;
+    }
+  }, 1000);
+}
+
 async function linkTelegram() {
   const api_id = document.getElementById("tg-api-id").value.trim();
   const api_hash = document.getElementById("tg-api-hash").value.trim();
@@ -674,39 +740,58 @@ async function linkTelegram() {
   if (!api_hash) { toast("❌ Ingresa el api_hash", "error"); return; }
   if (!phone) { toast("❌ Ingresa el número de teléfono", "error"); return; }
 
-  const btn = event.target;
+  const btn = document.getElementById("tg-link-btn");
   btn.disabled = true;
   btn.innerHTML = '⏳ Conectando...';
   document.getElementById("tg-link-status").innerHTML = '🔄 Solicitando código a Telegram...';
 
   try {
+    const payload = {api_id: parseInt(api_id), api_hash, phone, auth_attempt: tgAuthAttempt};
     const r = await fetch("/api/link_telegram", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({api_id: parseInt(api_id), api_hash, phone})
+      body: JSON.stringify(payload)
     });
     const d = await r.json();
     if (d.needs_code) {
-      // Mostrar campo de código
-      document.getElementById("tg-code-phone").textContent = phone;
+      if (d.auth_attempt) {
+        tgAuthAttempt = d.auth_attempt;
+        sessionStorage.setItem("tg_auth_attempt", tgAuthAttempt);
+      }
+      if (!tgAuthAttempt || d.owned_by_this_browser === false) {
+        document.getElementById("tg-code-section").style.display = 'none';
+        document.getElementById("tg-link-status").innerHTML =
+          '⚠️ Ya existe una autorización activa en otro navegador. Espera a que termine o continúa allí.';
+        armTgRetry(d.retry_after ?? 30);
+        return;
+      }
       document.getElementById("tg-code-section").style.display = 'block';
       document.getElementById("tg-code-input").value = '';
       document.getElementById("tg-code-input").focus();
       document.getElementById("tg-code-status").innerHTML = '';
-      document.getElementById("tg-link-status").innerHTML = '📨 Código enviado a Telegram. Revísalo e ingrésalo abajo.';
-      btn.disabled = false;
-      btn.innerHTML = '🔗 Vincular';
+      const prefix = d.request_in_progress ? 'Ya hay una solicitud activa.' : 'Telegram aceptó la solicitud.';
+      const next = d.next_delivery ? ` Si no llega, después podrá intentar por ${d.next_delivery}.` : '';
+      document.getElementById("tg-code-help").textContent =
+        `Busca el código en ${d.delivery || 'el canal elegido por Telegram'}.${next}`;
+      document.getElementById("tg-link-status").innerHTML = `📨 ${prefix} No solicites otro hasta que termine la espera.`;
+      armTgRetry(d.retry_after ?? d.timeout_seconds ?? 30);
     } else if (d.ok) {
+      tgAuthAttempt = null;
+      sessionStorage.removeItem("tg_auth_attempt");
+      document.getElementById("tg-api-hash").value = '';
       toast("✅ Vinculado. El bot se conectará como usuario.", "success");
-      document.getElementById("tg-link-status").innerHTML = '✅ <strong>Vinculado</strong>';
+      document.getElementById("tg-link-status").innerHTML = '✅ <strong>Sesión autorizada; iniciando Telegram…</strong>';
       setTimeout(() => document.getElementById("setup-modal").style.display = 'none', 1500);
       btn.disabled = false;
       btn.innerHTML = '🔗 Vincular';
     } else {
       toast("❌ " + (d.error || "Error"), "error");
       document.getElementById("tg-link-status").innerHTML = '❌ ' + (d.error || "Error");
-      btn.disabled = false;
-      btn.innerHTML = '🔗 Vincular';
+      if (d.retry_after) armTgRetry(d.retry_after);
+      else {
+        btn.disabled = false;
+        btn.innerHTML = '🔗 Vincular';
+      }
     }
   } catch(e) {
     toast("❌ Error: " + e.message, "error");
@@ -718,16 +803,20 @@ async function linkTelegram() {
 async function verifyTgCode() {
   const code = document.getElementById("tg-code-input").value.trim();
   if (!code) { toast("❌ Ingresa el código", "error"); return; }
+  document.getElementById("tg-code-input").value = '';
 
   document.getElementById("tg-code-status").innerHTML = '🔄 Verificando...';
   try {
     const r = await fetch("/api/verify_telegram_code", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({code})
+      body: JSON.stringify({code, auth_attempt: tgAuthAttempt})
     });
     const d = await r.json();
     if (d.ok) {
+      tgAuthAttempt = null;
+      sessionStorage.removeItem("tg_auth_attempt");
+      document.getElementById("tg-api-hash").value = '';
       toast("✅ ¡Vinculado correctamente!", "success");
       document.getElementById("tg-link-status").innerHTML = '✅ <strong>Vinculado</strong>';
       document.getElementById("tg-code-section").style.display = 'none';
@@ -748,16 +837,20 @@ async function verifyTgCode() {
 async function verifyTgPassword() {
   const password = document.getElementById("tg-password-input").value;
   if (!password) { toast("❌ Ingresa la contraseña", "error"); return; }
+  document.getElementById("tg-password-input").value = '';
 
   document.getElementById("tg-password-status").innerHTML = '🔄 Verificando...';
   try {
     const r = await fetch("/api/verify_telegram_password", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({password})
+      body: JSON.stringify({password, auth_attempt: tgAuthAttempt})
     });
     const d = await r.json();
     if (d.ok) {
+      tgAuthAttempt = null;
+      sessionStorage.removeItem("tg_auth_attempt");
+      document.getElementById("tg-api-hash").value = '';
       toast("✅ ¡Vinculado correctamente!", "success");
       document.getElementById("tg-link-status").innerHTML = '✅ <strong>Vinculado</strong>';
       document.getElementById("tg-code-section").style.display = 'none';
@@ -772,7 +865,21 @@ async function verifyTgPassword() {
 }
 
 async function cancelTgAuth() {
-  await fetch("/api/cancel_telegram_auth", {method: "POST"}).catch(() => {});
+  await fetch("/api/cancel_telegram_auth", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({auth_attempt: tgAuthAttempt})
+  }).catch(() => {});
+  tgAuthAttempt = null;
+  sessionStorage.removeItem("tg_auth_attempt");
+  if (tgRetryTimer) clearInterval(tgRetryTimer);
+  tgRetryTimer = null;
+  const btn = document.getElementById("tg-link-btn");
+  btn.disabled = false;
+  btn.innerHTML = '🔗 Vincular';
+  document.getElementById("tg-api-hash").value = '';
+  document.getElementById("tg-code-input").value = '';
+  document.getElementById("tg-password-input").value = '';
   document.getElementById("tg-code-section").style.display = 'none';
   document.getElementById("tg-2fa-section").style.display = 'none';
   document.getElementById("tg-link-status").innerHTML = '⚠️ Vinculación cancelada. Intenta de nuevo.';
@@ -880,8 +987,41 @@ def _read_env_var(key: str) -> str | None:
     return None
 
 
+def _normalize_telegram_phone(phone: str) -> str | None:
+    """Normaliza un teléfono internacional sin aceptar saltos ni texto."""
+    digits = re.sub(r"\D", "", (phone or "").strip())
+    if not 7 <= len(digits) <= 15:
+        return None
+    return "+" + digits
+
+
+def _valid_telegram_credentials(api_id, api_hash: str, phone: str) -> bool:
+    try:
+        valid_id = int(api_id) > 0
+    except (TypeError, ValueError):
+        valid_id = False
+    return bool(
+        valid_id
+        and re.fullmatch(r"[0-9a-fA-F]{32}", api_hash or "")
+        and re.fullmatch(r"\+[0-9]{7,15}", phone or "")
+    )
+
+
+def _telegram_credentials_match_saved(api_id, api_hash: str, phone: str) -> bool:
+    """Permite recuperar el navegador administrador con las credenciales TG."""
+    saved_id = os.environ.get("TG_API_ID") or _read_env_var("TG_API_ID") or ""
+    saved_hash = os.environ.get("TG_API_HASH") or _read_env_var("TG_API_HASH") or ""
+    saved_phone = os.environ.get("TG_PHONE") or _read_env_var("TG_PHONE") or ""
+    return (
+        secrets.compare_digest(str(api_id), str(saved_id))
+        and secrets.compare_digest(api_hash, saved_hash)
+        and secrets.compare_digest(phone, saved_phone)
+    )
+
+
 def _save_telegram_creds(api_id, api_hash, phone):
     """Guarda credenciales TG en data/.env.local."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     env_file = DATA_DIR / ".env.local"
     lines = []
     if env_file.exists():
@@ -906,22 +1046,154 @@ def _save_telegram_creds(api_id, api_hash, phone):
         if not found:
             val = str(api_id) if key == "TG_API_ID" else (api_hash if key == "TG_API_HASH" else phone)
             new_lines.append(f"{key}={val}\n")
-    with open(env_file, "w") as f:
+    temp_file = env_file.with_suffix(".tmp")
+    with open(temp_file, "w", encoding="utf-8", newline="\n") as f:
         f.writelines(new_lines)
+    try:
+        os.chmod(temp_file, 0o600)
+    except OSError:
+        pass
+    os.replace(temp_file, env_file)
+
+
+def _telegram_session_has_auth_key() -> bool:
+    """Comprueba la clave MTProto; por sí sola no prueba login de usuario."""
+    session_path = DATA_DIR / "tg_session.session"
+    if not session_path.is_file() or session_path.stat().st_size == 0:
+        return False
+    try:
+        uri = f"file:{session_path.as_posix()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1) as db:
+            row = db.execute("SELECT auth_key FROM sessions LIMIT 1").fetchone()
+        return bool(row and row[0])
+    except (OSError, sqlite3.Error):
+        return False
+
+
+def _write_telegram_authorized_marker() -> None:
+    """Marca una sesión sólo después de que Telegram confirmó al usuario."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    marker = DATA_DIR / "tg_session_authorized.json"
+    temp = marker.with_suffix(".tmp")
+    temp.write_text(
+        json.dumps({"authorized": True, "updated_at": time.time()}),
+        encoding="utf-8",
+    )
+    os.replace(temp, marker)
+
+
+def _telegram_session_is_authorized() -> bool:
+    """Exige auth key y la confirmación escrita tras is_user_authorized()."""
+    marker = DATA_DIR / "tg_session_authorized.json"
+    try:
+        with open(marker, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return bool(data.get("authorized")) and _telegram_session_has_auth_key()
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _telegram_heartbeat_is_fresh(max_age: int = 45) -> bool:
+    health_file = DATA_DIR / "tg_userbot_health.json"
+    try:
+        with open(health_file, "r", encoding="utf-8") as f:
+            health = json.load(f)
+        return bool(health.get("ready")) and time.time() - float(health["updated_at"]) <= max_age
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return False
+
+
+def _tracked_telegram_pid() -> int | None:
+    pid_file = DATA_DIR / "tg_userbot.pid"
+    try:
+        pid = int(pid_file.read_text(encoding="ascii").strip())
+        if pid <= 1 or pid == os.getpid():
+            return None
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def _is_telegram_worker_pid(pid: int) -> bool:
+    """Evita terminar BotFather u otro proceso si el PID quedó obsoleto."""
+    if sys.platform != "win32":
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "ignore")
+            return "bot.py" in cmdline and "botfather_bot.py" not in cmdline and "restart_bot.py" not in cmdline
+        except OSError:
+            return False
+    return True
+
+
+def _stop_telegram_worker() -> None:
+    pid_file = DATA_DIR / "tg_userbot.pid"
+    pid = _tracked_telegram_pid()
+    if pid and _is_telegram_worker_pid(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(20):
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.1)
+            else:
+                if sys.platform != "win32":
+                    os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        pid_file.unlink(missing_ok=True)
+        (DATA_DIR / "tg_userbot_health.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def restart_telegram_worker() -> tuple[bool, str]:
+    """Reinicia sólo el worker rastreado y comprueba que no muera al arrancar."""
+    api_id = os.environ.get("TG_API_ID") or _read_env_var("TG_API_ID")
+    api_hash = os.environ.get("TG_API_HASH") or _read_env_var("TG_API_HASH")
+    phone = os.environ.get("TG_PHONE") or _read_env_var("TG_PHONE")
+    if not api_id or not api_hash or not phone or not _telegram_session_is_authorized():
+        return False, "Telegram aún no tiene una sesión autorizada."
+
+    _stop_telegram_worker()
+    log_path = Path(os.environ.get("TG_LOG_PATH", "/tmp/bot_tg.log"))
+    if sys.platform == "win32" and str(log_path).startswith("/tmp/"):
+        log_path = DATA_DIR / "bot_tg.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update({"TG_API_ID": str(api_id), "TG_API_HASH": api_hash, "TG_PHONE": phone})
+
+    kwargs = {"cwd": str(BASE_DIR), "env": env, "start_new_session": True}
+    if sys.platform == "win32":
+        kwargs.pop("start_new_session")
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+
+    with open(log_path, "a", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            [sys.executable, str(BASE_DIR / "bot.py")],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            **kwargs,
+        )
+
+    pid_file = DATA_DIR / "tg_userbot.pid"
+    pid_temp = pid_file.with_suffix(".tmp")
+    pid_temp.write_text(str(proc.pid), encoding="ascii")
+    os.replace(pid_temp, pid_file)
+    time.sleep(1)
+    if proc.poll() is not None:
+        pid_file.unlink(missing_ok=True)
+        return False, "El proceso de Telegram terminó durante el arranque."
+    return True, "Telegram iniciado; la conexión se está comprobando."
 
 
 def bot_is_running():
     """Verifica si el bot de Telegram está corriendo (por archivo PID)."""
-    pid_file = DATA_DIR / "tg_userbot.pid"
-    try:
-        if not pid_file.exists():
-            return False
-        with open(pid_file, "r") as f:
-            pid = int(f.read().strip())
-        os.kill(pid, 0)
-        return True
-    except (OSError, ValueError):
-        return False
+    pid = _tracked_telegram_pid()
+    return bool(pid and _is_telegram_worker_pid(pid) and _telegram_heartbeat_is_fresh())
 
 @app.route("/")
 def index():
@@ -1385,160 +1657,131 @@ def is_bot_running():
 
 @app.route("/api/tg_status")
 def api_tg_status():
-    """Estado de la vinculación de Telegram (user bot)."""
+    """Estado no sensible de la vinculación de Telegram."""
     api_id = os.environ.get("TG_API_ID") or _read_env_var("TG_API_ID")
-    linked = bool(api_id)
-    result = {"linked": linked}
-    if linked:
-        phone = os.environ.get("TG_PHONE") or _read_env_var("TG_PHONE") or ""
-        # Mostrar últimos 4 dígitos del teléfono
-        if phone:
-            result["display_name"] = "📱 ..." + phone[-4:] if len(phone) > 4 else phone
-            result["phone"] = phone
-    return jsonify(result)
+    api_hash = os.environ.get("TG_API_HASH") or _read_env_var("TG_API_HASH")
+    phone = os.environ.get("TG_PHONE") or _read_env_var("TG_PHONE")
+    configured = bool(api_id and api_hash and phone)
+    session_authorized = _telegram_session_is_authorized()
+    worker_running = bot_is_running()
+    if worker_running:
+        state = "ready"
+    elif session_authorized:
+        state = "authorized_offline"
+    elif configured:
+        state = "needs_verification"
+    else:
+        state = "unconfigured"
+    return jsonify({
+        "configured": configured,
+        "session_authorized": session_authorized,
+        "linked": session_authorized,
+        "worker_running": worker_running,
+        "ready": worker_running,
+        "state": state,
+        "display_name": "Cuenta de Telegram" if session_authorized else None,
+    })
+
+
+def _finish_telegram_auth(outcome):
+    """Persiste sólo credenciales verificadas e inicia el worker."""
+    public = dict(outcome.public)
+    if outcome.attempt_token:
+        public["auth_attempt"] = outcome.attempt_token
+    if not outcome.credentials:
+        return public
+    api_id, api_hash, phone = outcome.credentials
+    _save_telegram_creds(api_id, api_hash, phone)
+    _write_telegram_authorized_marker()
+    os.environ.update({
+        "TG_API_ID": str(api_id),
+        "TG_API_HASH": api_hash,
+        "TG_PHONE": phone,
+    })
+    session["telegram_admin"] = True
+    session.permanent = True
+    started, message = restart_telegram_worker()
+    public.update({
+        "ok": started,
+        "authorized": True,
+        "worker_starting": started,
+        "message": message,
+    })
+    if not started:
+        public["error"] = message
+    return public
 
 
 @app.route("/api/link_telegram", methods=["POST"])
 def api_link_telegram():
-    """Inicia vinculación: guarda credenciales y pide código a Telegram desde el panel."""
-    from telethon import TelegramClient
-    from telethon.errors import ApiIdInvalidError
-
-    data = request.get_json()
+    """Inicia una autorización y describe el canal elegido por Telegram."""
+    data = request.get_json(silent=True) or {}
     api_id = data.get("api_id")
     api_hash = (data.get("api_hash") or "").strip()
-    phone = (data.get("phone") or "").strip()
+    phone = _normalize_telegram_phone(data.get("phone") or "")
 
-    if not api_id or not api_hash or not phone:
-        return jsonify({"ok": False, "error": "api_id, api_hash y phone son requeridos"}), 400
+    if not _valid_telegram_credentials(api_id, api_hash, phone or ""):
+        return jsonify({
+            "ok": False,
+            "error_code": "invalid_input",
+            "error": "Revisa api_id, api_hash y el teléfono en formato internacional.",
+        }), 400
 
-    # Guardar en .env.local
-    _save_telegram_creds(api_id, api_hash, phone)
+    # Una sesión autorizada no puede sobrescribirse desde el panel público.
+    if _telegram_session_is_authorized():
+        if not session.get("telegram_admin"):
+            if not _telegram_credentials_match_saved(api_id, api_hash, phone):
+                return jsonify({
+                    "ok": False,
+                    "error_code": "already_linked",
+                    "error": "Telegram ya está vinculado y las credenciales no coinciden.",
+                }), 403
+            session["telegram_admin"] = True
+            session.permanent = True
+        started, message = restart_telegram_worker()
+        return jsonify({
+            "ok": started,
+            "already_authorized": True,
+            "worker_starting": started,
+            "message": message,
+            **({} if started else {"error": message}),
+        })
 
-    # Setear en environment
-    os.environ["TG_API_ID"] = str(api_id)
-    os.environ["TG_API_HASH"] = api_hash
-    os.environ["TG_PHONE"] = phone
-
-    # Iniciar cliente Telethon
-    global _pending_auth
-    session_file = str(DATA_DIR / "tg_session")
-
-    def _do_auth():
-        loop = _asyncio.new_event_loop()
-        _asyncio.set_event_loop(loop)
-        try:
-            client = TelegramClient(session_file, api_id, api_hash)
-            loop.run_until_complete(client.connect())
-            result = loop.run_until_complete(client.send_code_request(phone))
-            _pending_auth = {
-                "client": client,
-                "phone_code_hash": result.phone_code_hash,
-                "phone": phone,
-            }
-            return {"ok": True, "needs_code": True, "phone_code_hash": result.phone_code_hash}
-        except ApiIdInvalidError:
-            return {"ok": False, "error": "api_id o api_hash inválidos"}
-        except Exception as e:
-            return {"ok": False, "error": f"Error de conexión: {str(e)}"}
-
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future = executor.submit(_do_auth)
-        result = future.result(timeout=20)
-        return jsonify(result)
+    outcome = _telegram_auth.begin(
+        int(api_id), api_hash, phone, data.get("auth_attempt")
+    )
+    return jsonify(_finish_telegram_auth(outcome))
 
 
 @app.route("/api/verify_telegram_code", methods=["POST"])
 def api_verify_telegram_code():
     """Verifica el código enviado por Telegram."""
-    from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
-
-    global _pending_auth
-
-    if not _pending_auth:
-        return jsonify({"ok": False, "error": "No hay autenticación pendiente"}), 400
-
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     code = (data.get("code") or "").strip()
-    if not code:
-        return jsonify({"ok": False, "error": "Código requerido"}), 400
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,31}", code):
+        return jsonify({"ok": False, "error": "Ingresa el código recibido, sin caracteres especiales."}), 400
 
-    client = _pending_auth["client"]
-    phone = _pending_auth["phone"]
-    phone_code_hash = _pending_auth["phone_code_hash"]
-
-    def _do_signin():
-        loop = _asyncio.new_event_loop()
-        _asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash))
-            loop.run_until_complete(client.disconnect())
-            _pending_auth.clear()
-            return {"ok": True, "message": "Vinculado correctamente"}
-        except SessionPasswordNeededError:
-            return {"ok": False, "needs_password": True, "message": "2FA requerido"}
-        except PhoneCodeInvalidError:
-            return {"ok": False, "error": "Código inválido. Intenta de nuevo."}
-        except Exception as e:
-            return {"ok": False, "error": f"Error: {str(e)}"}
-
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future = executor.submit(_do_signin)
-        result = future.result(timeout=20)
-        return jsonify(result)
+    outcome = _telegram_auth.verify_code(code, data.get("auth_attempt"))
+    return jsonify(_finish_telegram_auth(outcome))
 
 
 @app.route("/api/verify_telegram_password", methods=["POST"])
 def api_verify_telegram_password():
     """Verifica la contraseña de 2FA."""
-    global _pending_auth
-
-    if not _pending_auth:
-        return jsonify({"ok": False, "error": "No hay autenticación pendiente"}), 400
-
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     password = (data.get("password") or "")
-    if not password:
+    if not password or len(password) > 256:
         return jsonify({"ok": False, "error": "Contraseña requerida"}), 400
 
-    client = _pending_auth["client"]
-
-    def _do_password():
-        loop = _asyncio.new_event_loop()
-        _asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(client.sign_in(password=password))
-            loop.run_until_complete(client.disconnect())
-            _pending_auth.clear()
-            return {"ok": True, "message": "Vinculado correctamente"}
-        except Exception as e:
-            return {"ok": False, "error": f"Contraseña incorrecta: {str(e)}"}
-
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future = executor.submit(_do_password)
-        result = future.result(timeout=20)
-        return jsonify(result)
+    outcome = _telegram_auth.verify_password(password, data.get("auth_attempt"))
+    return jsonify(_finish_telegram_auth(outcome))
 
 
 @app.route("/api/cancel_telegram_auth", methods=["POST"])
 def api_cancel_telegram_auth():
     """Cancela la autenticación pendiente."""
-    global _pending_auth
-    if _pending_auth:
-        client = _pending_auth.get("client")
-        if client:
-            def _disconnect():
-                loop = _asyncio.new_event_loop()
-                _asyncio.set_event_loop(loop)
-                loop.run_until_complete(client.disconnect())
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                executor.submit(_disconnect)
-        _pending_auth.clear()
-    return jsonify({"ok": True})
+    data = request.get_json(silent=True) or {}
+    return jsonify(_telegram_auth.cancel(data.get("auth_attempt")).public)
 
 @app.route("/api/status")
 def api_status():
@@ -1689,47 +1932,18 @@ def restart_wa_bot():
 
 @app.route("/api/restart_bot", methods=["POST"])
 def api_restart_bot():
-    """Reinicia el bot usando script independiente que no mata el panel Flask."""
-    import subprocess, sys, os, time
-
-    restart_script = str(BASE_DIR / "restart_bot.py")
-    python = sys.executable
-
+    """Reinicia el worker rastreado y no devuelve logs internos."""
+    if not session.get("telegram_admin"):
+        return jsonify({
+            "ok": False,
+            "error": "Esta acción requiere el navegador que vinculó Telegram.",
+        }), 403
     try:
-        env = os.environ.copy()
-        # Pasar credenciales del user bot
-        
-        if sys.platform == "win32":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            proc = subprocess.Popen(
-                [python, restart_script],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=env,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
-                startupinfo=startupinfo
-            )
-        else:
-            proc = subprocess.Popen(
-                [python, restart_script],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env=env,
-                start_new_session=True
-            )
-        
-        # Esperar un poco y leer output
-        time.sleep(2)
-        try:
-            stdout, _ = proc.communicate(timeout=5)
-            output = stdout.decode("utf-8", errors="replace") if stdout else ""
-        except:
-            output = f"Bot restart launched (PID {proc.pid})"
-        
-        return jsonify({"ok": True, "message": f"Bot reiniciado", "output": output})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        started, message = restart_telegram_worker()
+        status = 200 if started else 409
+        return jsonify({"ok": started, "message": message, **({} if started else {"error": message})}), status
+    except Exception:
+        return jsonify({"ok": False, "error": "No fue posible reiniciar Telegram."}), 500
 
 @app.route("/api/restart_wa_bot", methods=["POST"])
 def api_restart_wa_bot():

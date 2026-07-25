@@ -28,11 +28,15 @@ if [ -f /app/data/.env.local ]; then
     export $(grep -v '^#' /app/data/.env.local | grep -E '^TG_(API_ID|API_HASH|PHONE)=' | xargs)
 fi
 
-if [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ]; then
+if [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ] \
+   && [ -s /app/data/tg_session.session ] \
+   && [ -s /app/data/tg_session_authorized.json ]; then
     echo "📱 Iniciando Bot Telegram (User Bot)..."
     nohup python bot.py > /tmp/bot_tg.log 2>&1 &
     echo $! > /app/data/tg_userbot.pid
     echo "  → PID: $!"
+elif [ -n "$TG_API_ID" ] && [ -n "$TG_API_HASH" ]; then
+    echo "⚠️  Credenciales de Telegram presentes, pero falta autorizar la sesión desde el panel."
 else
     echo "⚠️  Credenciales de user bot no configuradas. Configura api_id, api_hash y phone desde el panel."
 fi

@@ -10,6 +10,11 @@ __pycache__/
 
 # Auth sessions
 wa_auth/
+data/
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
 
 # Logs
 *.log

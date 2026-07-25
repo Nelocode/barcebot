@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.env.local
+data
+node_modules
+__pycache__
+*.pyc
+*.pyo
+*.log
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
+wa_auth
+wa_qr.png
+panel_screenshot*.png

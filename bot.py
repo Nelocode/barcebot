@@ -25,6 +25,8 @@ DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audios"
 MESSAGES_FILE = DATA_DIR / "messages.json"
 SESSION_FILE = str(DATA_DIR / "tg_session")  # Telethon session
+HEALTH_FILE = DATA_DIR / "tg_userbot_health.json"
+AUTHORIZED_MARKER_FILE = DATA_DIR / "tg_session_authorized.json"
 
 RESET_TIMEOUT = 3600  # 1 hora
 
@@ -146,6 +148,32 @@ def load_messages_fresh():
 client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
 
+def write_health(ready: bool) -> None:
+    """Publica un heartbeat mínimo, sin teléfono ni identidad de la cuenta."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = HEALTH_FILE.with_suffix(".tmp")
+    temp_file.write_text(
+        json.dumps({"ready": ready, "updated_at": time.time()}),
+        encoding="utf-8",
+    )
+    os.replace(temp_file, HEALTH_FILE)
+
+
+def write_authorized_marker() -> None:
+    temp_file = AUTHORIZED_MARKER_FILE.with_suffix(".tmp")
+    temp_file.write_text(
+        json.dumps({"authorized": True, "updated_at": time.time()}),
+        encoding="utf-8",
+    )
+    os.replace(temp_file, AUTHORIZED_MARKER_FILE)
+
+
+async def heartbeat() -> None:
+    while True:
+        write_health(True)
+        await asyncio.sleep(15)
+
+
 # ── Handlers ───────────────────────────────────────────────────────────
 
 @client.on(events.NewMessage(incoming=True))
@@ -248,12 +276,28 @@ async def main():
     )
 
     logging.info("Starting Telegram User Bot...")
-    await client.start(phone=PHONE or (lambda: os.environ.get("TG_CODE", "")))
-    me = await client.get_me()
-    logging.info("Logged in as @%s (%s %s)", me.username, me.first_name, me.last_name or "")
-    logging.info("User bot ready — no /start needed.")
+    await client.connect()
+    if not await client.is_user_authorized():
+        AUTHORIZED_MARKER_FILE.unlink(missing_ok=True)
+        raise RuntimeError("La sesión de Telegram no está autorizada; completa la vinculación en el panel.")
 
-    await client.run_until_disconnected()
+    write_authorized_marker()
+    logging.info("Telegram session authorized; user bot ready.")
+    write_health(True)
+    heartbeat_task = asyncio.create_task(heartbeat())
+    try:
+        await client.run_until_disconnected()
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            HEALTH_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        await client.disconnect()
 
 
 if __name__ == "__main__":
