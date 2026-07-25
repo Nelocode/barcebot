@@ -43,14 +43,14 @@ test('procesa el arreglo de llamadas que entrega Baileys', async () => {
 
   assert.equal(result[0].status, 'handled');
   assert.deepEqual(effects[0], ['reject', 'call-1', '573001234567@s.whatsapp.net']);
-  assert.deepEqual(effects[1], [
+  assert.equal(effects[1][0], 'send');
+  assert.equal(effects[1][2].mimetype, 'audio/mpeg');
+  assert.deepEqual(effects[1][2].audio, Buffer.from('audio'));
+  assert.deepEqual(effects[2], [
     'send',
     '573001234567@s.whatsapp.net',
     { text: 'No podemos responder ahora.' },
   ]);
-  assert.equal(effects[2][0], 'send');
-  assert.equal(effects[2][2].mimetype, 'audio/mpeg');
-  assert.deepEqual(effects[2][2].audio, Buffer.from('audio'));
 });
 
 test('envia OGG/Opus como nota de voz cuando el lector lo proporciona', async () => {
@@ -64,11 +64,40 @@ test('envia OGG/Opus como nota de voz cuando el lector lo proporciona', async ()
 
   await handler([offer()]);
 
-  assert.deepEqual(effects[2][2], {
+  assert.deepEqual(effects[1][2], {
     audio: Buffer.from('opus'),
     mimetype: 'audio/ogg; codecs=opus',
     ptt: true,
   });
+  assert.equal(effects[2][2].text, 'No podemos responder ahora.');
+});
+
+test('espera la confirmacion del audio antes de iniciar el texto', async () => {
+  const deliveries = [];
+  let releaseAudio;
+  let markAudioStarted;
+  const audioGate = new Promise(resolve => { releaseAudio = resolve; });
+  const audioStarted = new Promise(resolve => { markAudioStarted = resolve; });
+  const { handler } = createHarness({
+    sendMessage: async (_jid, content) => {
+      if (content.audio) {
+        deliveries.push('audio');
+        markAudioStarted();
+        await audioGate;
+      } else {
+        deliveries.push('text');
+      }
+    },
+  });
+
+  const pending = handler([offer()]);
+  await audioStarted;
+  await Promise.resolve();
+  assert.deepEqual(deliveries, ['audio']);
+
+  releaseAudio();
+  await pending;
+  assert.deepEqual(deliveries, ['audio', 'text']);
 });
 
 test('procesa todas las ofertas del mismo lote de forma aislada', async () => {
@@ -153,7 +182,7 @@ test('un rechazo bloqueado vence y la respuesta continúa', async () => {
   assert.equal(effects.filter(([kind]) => kind === 'send').length, 2);
 });
 
-test('un fallo enviando texto no impide intentar el audio', async () => {
+test('un fallo enviando texto ocurre despues de haber enviado el audio', async () => {
   const effects = [];
   const { handler } = createHarness({
     sendMessage: async (jid, content) => {
@@ -167,7 +196,8 @@ test('un fallo enviando texto no impide intentar el audio', async () => {
   assert.equal(result[0].text, 'failed');
   assert.equal(result[0].audio, 'sent');
   assert.equal(effects.length, 2);
-  assert.ok(effects[1][2].audio);
+  assert.ok(effects[0][2].audio);
+  assert.equal(effects[1][2].text, 'No podemos responder ahora.');
 });
 
 test('un audio ausente no impide enviar el texto', async () => {
@@ -178,6 +208,7 @@ test('un audio ausente no impide enviar el texto', async () => {
   assert.equal(result[0].text, 'sent');
   assert.equal(result[0].audio, 'missing');
   assert.equal(effects.filter(([kind]) => kind === 'send').length, 1);
+  assert.equal(effects[1][2].text, 'No podemos responder ahora.');
 });
 
 test('usa chatId para responder y from para rechazar', async () => {

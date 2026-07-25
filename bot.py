@@ -45,6 +45,7 @@ from telegram_dispatcher import (
     TelegramInteractionDispatcher,
     build_telegram_media_request,
     build_telegram_text_request,
+    deliver_telegram_response_components,
 )
 
 
@@ -389,7 +390,7 @@ async def send_response(
         lambda: client.get_input_entity(delivery_peer),
     )
 
-    if message_text:
+    async def send_text_message():
         await _retry_telegram_operation(
             "text_delivery",
             lambda: client(
@@ -401,7 +402,7 @@ async def send_response(
             ),
         )
 
-    if audio_file:
+    async def send_audio_message():
         audio_path = AUDIO_DIR / audio_file
         if not audio_path.exists():
             update_delivery_health("audio", "missing")
@@ -456,6 +457,12 @@ async def send_response(
             "audio_delivery",
             send_audio_media,
         )
+
+    await deliver_telegram_response_components(
+        response_key,
+        send_text=send_text_message if message_text else None,
+        send_audio=send_audio_message if audio_file else None,
+    )
 
 
 telegram_dispatcher = TelegramInteractionDispatcher(interaction_state, send_response)

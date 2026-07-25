@@ -10,11 +10,109 @@ from telegram_dispatcher import (
     TelegramInteractionDispatcher,
     build_telegram_media_request,
     build_telegram_text_request,
+    deliver_telegram_response_components,
     telegram_delivery_random_id,
 )
 
 
 class TelegramInteractionDispatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_call_delivers_audio_before_text(self):
+        order = []
+
+        async def send_text():
+            order.append("text")
+
+        async def send_audio():
+            order.append("audio")
+
+        await deliver_telegram_response_components(
+            "call",
+            send_text=send_text,
+            send_audio=send_audio,
+        )
+
+        self.assertEqual(["audio", "text"], order)
+
+    async def test_steps_keep_text_before_audio(self):
+        for response_key in ("step1", "step2"):
+            with self.subTest(response_key=response_key):
+                order = []
+
+                async def send_text():
+                    order.append("text")
+
+                async def send_audio():
+                    order.append("audio")
+
+                await deliver_telegram_response_components(
+                    response_key,
+                    send_text=send_text,
+                    send_audio=send_audio,
+                )
+
+                self.assertEqual(["text", "audio"], order)
+
+    async def test_call_partial_retry_reuses_component_random_ids(self):
+        fingerprint = "f" * 64
+        peer = types.InputPeerSelf()
+        attempts = []
+        text_attempts = 0
+
+        async def send_audio():
+            request = build_telegram_media_request(
+                peer,
+                types.InputMediaEmpty(),
+                fingerprint,
+            )
+            attempts.append(("audio", request.random_id))
+
+        async def send_text():
+            nonlocal text_attempts
+            request = build_telegram_text_request(peer, "respuesta", fingerprint)
+            attempts.append(("text", request.random_id))
+            text_attempts += 1
+            if text_attempts == 1:
+                raise RuntimeError("ambiguous text delivery")
+
+        with self.assertRaises(RuntimeError):
+            await deliver_telegram_response_components(
+                "call",
+                send_text=send_text,
+                send_audio=send_audio,
+            )
+        await deliver_telegram_response_components(
+            "call",
+            send_text=send_text,
+            send_audio=send_audio,
+        )
+
+        self.assertEqual(
+            ["audio", "text", "audio", "text"],
+            [component for component, _random_id in attempts],
+        )
+        self.assertEqual(attempts[0][1], attempts[2][1])
+        self.assertEqual(attempts[1][1], attempts[3][1])
+        self.assertNotEqual(attempts[0][1], attempts[1][1])
+
+    async def test_call_audio_failure_still_attempts_text_and_propagates(self):
+        order = []
+
+        async def send_audio():
+            order.append("audio")
+            raise RuntimeError("audio failed")
+
+        async def send_text():
+            order.append("text")
+
+        with self.assertRaisesRegex(RuntimeError, "audio failed"):
+            await deliver_telegram_response_components(
+                "call",
+                send_text=send_text,
+                send_audio=send_audio,
+            )
+
+        self.assertEqual(["audio", "text"], order)
+
     async def test_same_chat_delivers_step1_completely_before_step2(self):
         with tempfile.TemporaryDirectory() as directory:
             state = PersistentInteractionState(Path(directory) / "state.json")

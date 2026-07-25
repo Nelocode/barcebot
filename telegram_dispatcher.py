@@ -56,6 +56,43 @@ def build_telegram_media_request(
     )
 
 
+async def deliver_telegram_response_components(
+    response_key: str,
+    *,
+    send_text: Callable[[], Awaitable[object]] | None,
+    send_audio: Callable[[], Awaitable[object]] | None,
+) -> None:
+    """Deliver one response in the channel-specific presentation order.
+
+    Calls intentionally put the audio first so Telegram renders the text below
+    it.  Normal conversation steps retain their historic text-then-audio order.
+    The component senders keep using their stable per-interaction ``random_id``;
+    therefore replaying this orchestration after a partial/ambiguous failure is
+    idempotent at Telegram's MTProto boundary.
+    """
+
+    if response_key != "call":
+        for sender in (send_text, send_audio):
+            if sender is not None:
+                await sender()
+        return
+
+    first_error: Exception | None = None
+    for sender in (send_audio, send_text):
+        if sender is None:
+            continue
+        try:
+            await sender()
+        except Exception as exc:
+            # A missing/failed audio must not suppress the useful call text.
+            # Re-raising after both attempts keeps the interaction uncommitted,
+            # allowing the stable component random_ids to make retries safe.
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
+
+
 class TelegramInteractionDispatcher:
     def __init__(
         self,

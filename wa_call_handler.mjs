@@ -295,20 +295,9 @@ export function createWhatsAppCallHandler({
       }
 
       const text = typeof callMessage.text === 'string' ? callMessage.text.trim() : '';
-      if (text) {
-        try {
-          await settleWithTimeout(
-            Promise.resolve(sendMessage(replyJid, { text })),
-            sendTimeoutMs,
-            'El envío de texto de la llamada',
-          );
-          result.text = 'sent';
-        } catch {
-          result.text = 'failed';
-          logger.error?.('[WA CALL] Text delivery failed');
-        }
-      }
-
+      // Call replies deliberately send the voice note first so WhatsApp renders
+      // the dedicated call audio above its accompanying text. Normal Step 1 / 2
+      // responses keep their existing text-first order in wa_message_handler.
       if (callMessage.audio) {
         try {
           const audioContent = toWhatsAppAudioContent(await readAudio(callMessage.audio));
@@ -325,6 +314,22 @@ export function createWhatsAppCallHandler({
         } catch {
           result.audio = 'failed';
           logger.error?.('[WA CALL] Audio delivery failed');
+        }
+      }
+
+      // Keep this independent from audio delivery: a missing or failed audio
+      // must not prevent the useful call instructions from reaching the user.
+      if (text) {
+        try {
+          await settleWithTimeout(
+            Promise.resolve(sendMessage(replyJid, { text })),
+            sendTimeoutMs,
+            'El envío de texto de la llamada',
+          );
+          result.text = 'sent';
+        } catch {
+          result.text = 'failed';
+          logger.error?.('[WA CALL] Text delivery failed');
         }
       }
       return { reason: 'completed', result, language };
