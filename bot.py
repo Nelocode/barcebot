@@ -26,6 +26,10 @@ from telethon.tl import types
 
 from interaction_state import PersistentInteractionState
 from message_schema import load_message_file
+from telegram_audio_branding import (
+    brand_audio_attributes,
+    build_branded_audio_media,
+)
 from telegram_call_rejection import TelegramCallRejectCoordinator
 from telegram_events import (
     PHONE_CALL_SUBTYPES,
@@ -47,6 +51,7 @@ from telegram_dispatcher import (
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audios"
+AUDIO_COVER_PATH = BASE_DIR / "assets" / "audio-cover.jpg"
 MESSAGES_FILE = DATA_DIR / "messages.json"
 DEFAULT_MESSAGES_FILE = BASE_DIR / "messages.json"
 SESSION_FILE = str(DATA_DIR / "tg_session")
@@ -406,22 +411,46 @@ async def send_response(
             force_document=False,
             voice_note=False,
         )
+        audio_attributes = brand_audio_attributes(
+            audio_attributes,
+            filename=audio_path.name,
+        )
 
         async def send_audio_media():
             uploaded_file = await client.upload_file(str(audio_path))
-            media = types.InputMediaUploadedDocument(
-                file=uploaded_file,
-                mime_type=audio_mime_type,
-                attributes=audio_attributes,
-                force_file=False,
-            )
-            return await client(
-                build_telegram_media_request(
+            uploaded_thumb = None
+            if AUDIO_COVER_PATH.is_file():
+                try:
+                    uploaded_thumb = await client.upload_file(str(AUDIO_COVER_PATH))
+                except (OSError, errors.RPCError) as exc:
+                    logging.warning(
+                        "Telegram audio cover upload failed (%s); sending without it",
+                        type(exc).__name__,
+                    )
+
+            def media_request(thumb):
+                media = build_branded_audio_media(
+                    uploaded_file=uploaded_file,
+                    uploaded_thumb=thumb,
+                    mime_type=audio_mime_type,
+                    attributes=audio_attributes,
+                )
+                return build_telegram_media_request(
                     resolved_peer,
                     media,
                     delivery_fingerprint,
                 )
-            )
+
+            try:
+                return await client(media_request(uploaded_thumb))
+            except errors.RPCError as exc:
+                if uploaded_thumb is None:
+                    raise
+                logging.warning(
+                    "Telegram rejected the audio cover (%s); retrying without it",
+                    type(exc).__name__,
+                )
+                return await client(media_request(None))
 
         await _retry_telegram_operation(
             "audio_delivery",
