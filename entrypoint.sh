@@ -54,6 +54,7 @@ fi
 if [ -d "/app/data/wa_auth" ] && [ "$(ls -A /app/data/wa_auth 2>/dev/null)" ]; then
     echo "💬 Iniciando Bot WhatsApp..."
     nohup node wa_bot.mjs > /tmp/bot_wa.log 2>&1 &
+    echo $! > /app/data/wa_bot.pid
     echo "  → PID: $!"
 else
     echo "⚠️  WhatsApp no vinculado. Se vincula desde el panel."
