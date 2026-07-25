@@ -12,6 +12,7 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audios"
 MESSAGES_FILE = DATA_DIR / "messages.json"
+WA_CALL_HEALTH_FILE = DATA_DIR / "wa_call_health.json"
 
 app = Flask(__name__)
 APP_SECRET = os.environ.get("FLASK_SECRET", "bot-autoreply-secret-change-me")
@@ -973,13 +974,144 @@ def api_wa_qr():
 
 @app.route("/api/wa_log")
 def api_wa_log():
-    """Devuelve las últimas líneas del log de WhatsApp para debug."""
-    log_path = BASE_DIR / "wa_bot.log"
-    if not log_path.exists():
-        return jsonify({"ok": False, "error": "No log file"})
-    with open(log_path, "r") as f:
-        lines = f.readlines()
-    return jsonify({"ok": True, "lines": lines[-50:]})  # Últimas 50 líneas
+    """Raw WhatsApp logs are intentionally never exposed over HTTP."""
+    return jsonify({
+        "ok": False,
+        "status": "disabled",
+        "replacement": "/api/wa_call_health",
+    }), 410
+
+
+_WA_CALL_HEALTH_DEFAULT = {
+    "schema_version": 1,
+    "available": False,
+    "worker_running": False,
+    "worker_revision": None,
+    "connection": "unknown",
+    "listener": "unknown",
+    "raw_listener": "unknown",
+    "raw_call_revision": None,
+    "parsed_call_revision": None,
+    "pipeline_revision": None,
+    "last_event": "never",
+    "last_batch": {"payload": "never", "size": "never"},
+    "pipeline": {
+        "event": "never",
+        "outcome": "never",
+        "reason": "never",
+        "offline": None,
+        "video": None,
+        "group": None,
+        "reject": "never",
+        "text": "never",
+        "audio": "never",
+    },
+}
+
+
+def _safe_uuid(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        import uuid
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _safe_enum(value, choices, fallback):
+    return value if isinstance(value, str) and value in choices else fallback
+
+
+def _read_wa_call_health():
+    result = json.loads(json.dumps(_WA_CALL_HEALTH_DEFAULT))
+    if not WA_CALL_HEALTH_FILE.exists():
+        return result
+    try:
+        with open(WA_CALL_HEALTH_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return result
+    if not isinstance(raw, dict):
+        return result
+    if raw.get("schema_version") != 1:
+        return result
+
+    result["available"] = True
+    result["worker_revision"] = _safe_uuid(raw.get("worker_revision"))
+    result["connection"] = _safe_enum(
+        raw.get("connection"),
+        {"starting", "connecting", "open", "closed", "unknown"},
+        "unknown",
+    )
+    result["listener"] = _safe_enum(
+        raw.get("listener"), {"pending", "registered", "unknown"}, "unknown"
+    )
+    result["raw_listener"] = _safe_enum(
+        raw.get("raw_listener"),
+        {"pending", "registered", "unavailable", "unknown"},
+        "unknown",
+    )
+    for key in ("raw_call_revision", "parsed_call_revision", "pipeline_revision"):
+        result[key] = _safe_uuid(raw.get(key))
+    event_states = {
+        "offer", "ringing", "preaccept", "transport", "relaylatency", "terminate",
+        "timeout", "reject", "accept", "other", "missing", "never"
+    }
+    result["last_event"] = _safe_enum(raw.get("last_event"), event_states, "other")
+
+    batch = raw.get("last_batch") if isinstance(raw.get("last_batch"), dict) else {}
+    result["last_batch"] = {
+        "payload": _safe_enum(
+            batch.get("payload"), {"array", "object", "invalid", "never"}, "never"
+        ),
+        "size": _safe_enum(
+            batch.get("size"), {"empty", "one", "multiple", "never"}, "never"
+        ),
+    }
+
+    pipeline = raw.get("pipeline") if isinstance(raw.get("pipeline"), dict) else {}
+    delivery = {
+        "sent", "failed", "missing", "skipped", "skipped_offline",
+        "not_applicable", "never"
+    }
+    result["pipeline"] = {
+        "event": _safe_enum(
+            pipeline.get("event"),
+            event_states,
+            "other",
+        ),
+        "outcome": _safe_enum(
+            pipeline.get("outcome"), {"handled", "ignored", "failed", "never"}, "failed"
+        ),
+        "reason": _safe_enum(
+            pipeline.get("reason"),
+            {"completed", "non_offer", "invalid_event", "missing_identity", "group_call", "duplicate", "unexpected_error", "never"},
+            "unexpected_error",
+        ),
+        "offline": pipeline.get("offline") if isinstance(pipeline.get("offline"), bool) else None,
+        "video": pipeline.get("video") if isinstance(pipeline.get("video"), bool) else None,
+        "group": pipeline.get("group") if isinstance(pipeline.get("group"), bool) else None,
+        "reject": _safe_enum(pipeline.get("reject"), delivery, "not_applicable"),
+        "text": _safe_enum(pipeline.get("text"), delivery, "not_applicable"),
+        "audio": _safe_enum(pipeline.get("audio"), delivery, "not_applicable"),
+    }
+    return result
+
+
+@app.route("/api/wa_call_health")
+def api_wa_call_health():
+    """Returns only an allowlisted, identifier-free call pipeline snapshot."""
+    health = _read_wa_call_health()
+    worker_running = wa_is_running()
+    health["worker_running"] = worker_running
+    if worker_running is not True:
+        health["connection"] = "closed" if worker_running is False else "unknown"
+    response = jsonify(health)
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 @app.route("/api/messages", methods=["POST"])
 def api_messages():
@@ -1528,7 +1660,7 @@ def restart_wa_bot():
     # Lanzar nuevo proceso wa_bot.mjs
     node = "node"
     wa_script = str(BASE_DIR / "wa_bot.mjs")
-    log_file = str(BASE_DIR / "wa_bot.log")
+    log_file = "/tmp/bot_wa.log"
     
     with open(log_file, "a") as f:
         f.write(f"\n--- Started at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")

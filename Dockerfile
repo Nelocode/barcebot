@@ -11,11 +11,11 @@ RUN apt-get update && apt-get install -y curl gnupg procps && \
 
 # ── Copiar dependencias primero (caché de Docker) ──
 # Build: 2026-07-24 — force rebuild for python-telegram-bot
-COPY requirements.txt package.json ./
+COPY requirements.txt package.json package-lock.json ./
 
 # ── Instalar dependencias ──
 RUN pip install --no-cache-dir -r requirements.txt && \
-    npm install --production --ignore-scripts && \
+    npm ci --omit=dev --ignore-scripts && \
     npm cache clean --force
 
 # ── Copiar el código ──

@@ -1,0 +1,126 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
+import { createWhatsAppCallHealth } from '../wa_call_health.mjs';
+
+function idFactory() {
+  let value = 0;
+  return () => `00000000-0000-4000-8000-${String(++value).padStart(12, '0')}`;
+}
+
+test('persiste solo un snapshot anonimizado y acotado', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-health-'));
+  const filePath = path.join(directory, 'health.json');
+  const health = createWhatsAppCallHealth({
+    filePath,
+    idFactory: idFactory(),
+    logger: { warn() {} },
+  });
+
+  health.record({ type: 'connection', state: 'open', phone: '573001234567' });
+  health.record({ type: 'listener_registered', jid: '573001234567@s.whatsapp.net' });
+  health.record({ type: 'raw_listener', state: 'registered' });
+  health.record({ type: 'raw_call', id: 'call-1' });
+  health.record({ type: 'batch', payload: 'array', size: 'one', from: '573001234567@s.whatsapp.net' });
+  health.record({
+    type: 'outcome',
+    event: 'offer',
+    outcome: 'handled',
+    reason: 'completed',
+    offline: false,
+    video: false,
+    group: false,
+    reject: 'sent',
+    text: 'sent',
+    audio: 'sent',
+    callId: 'call-1',
+    replyJid: '573001234567@s.whatsapp.net',
+    message: 'No podemos responder ahora',
+    audioPath: 'call.mp3',
+  });
+
+  const persisted = fs.readFileSync(filePath, 'utf8');
+  const parsed = JSON.parse(persisted);
+  assert.equal(parsed.connection, 'open');
+  assert.equal(parsed.listener, 'registered');
+  assert.equal(parsed.raw_listener, 'registered');
+  assert.equal(parsed.pipeline.event, 'offer');
+  assert.equal(parsed.last_event, 'offer');
+  assert.equal(parsed.pipeline.outcome, 'handled');
+  assert.doesNotMatch(
+    persisted,
+    /573001234567|@s\.whatsapp\.net|call-1|No podemos|call\.mp3|phone|jid|callId|message|audioPath/,
+  );
+  assert.ok(persisted.length < 2_000);
+
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('normaliza valores desconocidos a enums seguros', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-health-'));
+  const filePath = path.join(directory, 'health.json');
+  const health = createWhatsAppCallHealth({
+    filePath,
+    idFactory: idFactory(),
+    logger: { warn() {} },
+  });
+
+  health.record({
+    type: 'outcome',
+    event: 'private-573001234567',
+    outcome: 'private',
+    reason: 'private',
+    reject: 'private',
+    text: 'private',
+    audio: 'private',
+  });
+
+  const snapshot = health.snapshot();
+  assert.equal(snapshot.last_event, 'other');
+  assert.equal(snapshot.pipeline.event, 'never');
+  assert.equal(snapshot.pipeline.outcome, 'never');
+  assert.equal(snapshot.pipeline.reason, 'never');
+  assert.equal(snapshot.pipeline.reject, 'never');
+  assert.doesNotMatch(JSON.stringify(snapshot), /573001234567|private/);
+
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('conserva el resultado de la oferta aunque llegue terminate despues', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-health-'));
+  const filePath = path.join(directory, 'health.json');
+  const health = createWhatsAppCallHealth({
+    filePath,
+    idFactory: idFactory(),
+    logger: { warn() {} },
+  });
+
+  health.record({
+    type: 'outcome',
+    event: 'offer',
+    outcome: 'handled',
+    reason: 'completed',
+    reject: 'sent',
+    text: 'sent',
+    audio: 'sent',
+  });
+  const offerRevision = health.snapshot().pipeline_revision;
+  health.record({
+    type: 'outcome',
+    event: 'terminate',
+    outcome: 'ignored',
+    reason: 'non_offer',
+  });
+
+  const snapshot = health.snapshot();
+  assert.equal(snapshot.last_event, 'terminate');
+  assert.equal(snapshot.pipeline_revision, offerRevision);
+  assert.equal(snapshot.pipeline.event, 'offer');
+  assert.equal(snapshot.pipeline.outcome, 'handled');
+  assert.equal(snapshot.pipeline.text, 'sent');
+
+  fs.rmSync(directory, { recursive: true, force: true });
+});

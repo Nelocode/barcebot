@@ -7,8 +7,10 @@ echo "║   Bot AutoReply — Iniciando servicios       ║"
 echo "╚══════════════════════════════════════════════╝"
 
 # ── 0. Instalar dependencias faltantes si es necesario ───────────────
-pip install python-telegram-bot>=21.0 2>/dev/null || true
-cd /app && npm install --production --ignore-scripts 2>/dev/null || true
+pip install 'python-telegram-bot>=21.0' 2>/dev/null || true
+if [ ! -d /app/node_modules/@whiskeysockets/baileys ]; then
+    cd /app && npm ci --omit=dev --ignore-scripts
+fi
 
 # ── 0b. Preparar directorio de datos persistente ─────────────────────
 mkdir -p /app/data/audios /app/data/wa_auth

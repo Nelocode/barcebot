@@ -5,6 +5,7 @@ import { createWhatsAppCallHandler } from '../wa_call_handler.mjs';
 
 function createHarness(overrides = {}) {
   const effects = [];
+  const metrics = [];
   const logger = { info() {}, warn() {}, error() {} };
   const handler = createWhatsAppCallHandler({
     rejectCall: async (id, from) => effects.push(['reject', id, from]),
@@ -13,9 +14,10 @@ function createHarness(overrides = {}) {
     readAudio: async () => Buffer.from('audio'),
     getLanguage: () => 'es',
     logger,
+    onCallMetric: (metric) => metrics.push(metric),
     ...overrides,
   });
-  return { handler, effects };
+  return { handler, effects, metrics };
 }
 
 function offer(overrides = {}) {
@@ -179,4 +181,54 @@ test('tolera payload vacío o un objeto individual', async () => {
 
   assert.equal(result[0].status, 'handled');
   assert.equal(effects.filter(([kind]) => kind === 'reject').length, 1);
+});
+
+test('emite diagnostico anonimizado por lote y resultado', async () => {
+  const { handler, metrics } = createHarness();
+
+  await handler([offer()]);
+
+  assert.equal(metrics[0].type, 'batch');
+  assert.deepEqual(metrics[0], { type: 'batch', payload: 'array', size: 'one' });
+  assert.equal(metrics[1].type, 'outcome');
+  assert.equal(metrics[1].event, 'offer');
+  assert.equal(metrics[1].outcome, 'handled');
+  assert.equal(metrics[1].reason, 'completed');
+  assert.equal(metrics[1].reject, 'sent');
+  assert.equal(metrics[1].text, 'sent');
+  assert.equal(metrics[1].audio, 'sent');
+
+  const serialized = JSON.stringify(metrics);
+  assert.doesNotMatch(serialized, /573001234567|@s\.whatsapp\.net|call-1|call\.mp3|No podemos/);
+});
+
+test('un observador de diagnostico defectuoso no altera la respuesta', async () => {
+  const { handler, effects } = createHarness({
+    onCallMetric: () => {
+      throw new Error('diagnostic unavailable');
+    },
+  });
+
+  const result = await handler([offer()]);
+
+  assert.equal(result[0].status, 'handled');
+  assert.equal(effects.filter(([kind]) => kind === 'send').length, 2);
+});
+
+test('cada rama ignorada emite una razon de cardinalidad cerrada', async () => {
+  const { handler, metrics } = createHarness();
+
+  await handler([
+    offer({ status: 'future_status_with_private_data_573001234567' }),
+    offer({ id: '' }),
+    offer({ id: 'call-2', isGroup: true }),
+  ]);
+
+  const outcomes = metrics.filter((metric) => metric.type === 'outcome');
+  assert.deepEqual(outcomes.map((metric) => metric.reason), [
+    'non_offer',
+    'missing_identity',
+    'group_call',
+  ]);
+  assert.doesNotMatch(JSON.stringify(outcomes), /573001234567|@s\.whatsapp\.net|call-/);
 });

@@ -10,13 +10,33 @@ import { fileURLToPath } from 'url';
 import { Boom } from '@hapi/boom';
 import QRCode from 'qrcode';
 import { createWhatsAppCallHandler } from './wa_call_handler.mjs';
+import { createWhatsAppCallHealth } from './wa_call_health.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = path.resolve(process.env.BOT_DIR || __dirname);
 const AUDIO_DIR = path.join(BASE_DIR, 'data', 'audios');
 const MESSAGES_FILE = path.join(BASE_DIR, 'data', 'messages.json');
 const AUTH_DIR = path.join(BASE_DIR, 'data', 'wa_auth');
+const CALL_HEALTH_FILE = path.join(BASE_DIR, 'data', 'wa_call_health.json');
 const RESET_TIMEOUT = 3600 * 1000; // 1 hora en ms
+const callHealth = createWhatsAppCallHealth({ filePath: CALL_HEALTH_FILE, logger: console });
+const RECONNECT_DELAY_MS = 2_000;
+
+let activeSocket = null;
+let reconnectTimer = null;
+let shuttingDown = false;
+
+function scheduleReconnect() {
+  if (shuttingDown || reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (shuttingDown) return;
+    startBot().catch(() => {
+      console.error('[WA] Reconnection setup failed');
+      scheduleReconnect();
+    });
+  }, RECONNECT_DELAY_MS);
+}
 
 // ── Cargar mensajes ──
 function loadMessages() {
@@ -119,12 +139,43 @@ async function startBot() {
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
+  callHealth.record({ type: 'connection', state: 'connecting' });
+
   const sock = makeWASocket({
     auth: state,
     syncFullHistory: false,
     markOnlineOnConnect: true,
     browser: ['AutoReply Bot', 'Chrome', '120.0'],
   });
+  activeSocket = sock;
+
+  // Observe only that a raw call stanza arrived. Never persist its payload.
+  if (typeof sock.ws?.on === 'function') {
+    sock.ws.on('CB:call', () => callHealth.record({ type: 'raw_call' }));
+    callHealth.record({ type: 'raw_listener', state: 'registered' });
+  } else {
+    callHealth.record({ type: 'raw_listener', state: 'unavailable' });
+  }
+
+  // Register immediately: call events are not buffered by Baileys.
+  const handleCallBatch = createWhatsAppCallHandler({
+    rejectCall: (callId, callFrom) => sock.rejectCall(callId, callFrom),
+    sendMessage: (jid, content) => sock.sendMessage(jid, content),
+    getCallMessage,
+    readAudio,
+    getLanguage: (call, replyJid) => {
+      const candidates = [replyJid, call.chatId, call.callerPn, call.from].filter(Boolean);
+      for (const jid of candidates) {
+        const state = userState.get(jid);
+        if (state && !isExpired(state)) return state.lang;
+      }
+      return 'en';
+    },
+    logger: console,
+    onCallMetric: callHealth.record,
+  });
+  sock.ev.on('call', handleCallBatch);
+  callHealth.record({ type: 'listener_registered' });
 
   // ── Guardar credenciales cuando se actualicen ──
   sock.ev.on('creds.update', saveCreds);
@@ -147,6 +198,9 @@ async function startBot() {
     }
 
     if (connection === 'close') {
+      if (activeSocket !== sock) return;
+      activeSocket = null;
+      callHealth.record({ type: 'connection', state: 'closed' });
       const shouldReconnect = (lastDisconnect?.error instanceof Boom)
         ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
         : true;
@@ -154,42 +208,22 @@ async function startBot() {
       console.log(`[WA] Conexión cerrada. Reconnect: ${shouldReconnect}`);
 
       if (shouldReconnect) {
-        startBot();
+        scheduleReconnect();
       } else {
         console.log('[WA] Sesión cerrada. Vuelve a escanear QR borrando wa_auth/');
       }
     }
 
     if (connection === 'open') {
-      console.log(`[WA] ✅ Conectado como ${sock.user?.name || sock.user?.id}`);
+      if (activeSocket !== sock) return;
+      callHealth.record({ type: 'connection', state: 'open' });
+      console.log('[WA] Connected');
     }
   });
-
-  // ── Manejar llamadas entrantes ──
-  // Baileys emite un arreglo WACallEvent[], incluso si solo hay una llamada.
-  const handleCallBatch = createWhatsAppCallHandler({
-    rejectCall: (callId, callFrom) => sock.rejectCall(callId, callFrom),
-    sendMessage: (jid, content) => sock.sendMessage(jid, content),
-    getCallMessage,
-    readAudio,
-    getLanguage: (call, replyJid) => {
-      const candidates = [replyJid, call.chatId, call.callerPn, call.from].filter(Boolean);
-      for (const jid of candidates) {
-        const state = userState.get(jid);
-        if (state && !isExpired(state)) return state.lang;
-      }
-      return 'en';
-    },
-    logger: console,
-  });
-  sock.ev.on('call', handleCallBatch);
 
   // ── Manejar mensajes entrantes ──
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     console.log(`[WA] messages.upsert type=${type} count=${messages.length}`);
-    for (const m of messages) {
-      console.log(`[WA]   msg key=${JSON.stringify(m.key)} fromMe=${m.key.fromMe} hasMsg=${!!m.message} type=${type}`);
-    }
     // Solo procesar notify (mensajes reales), ignorar sync/echo
     if (type !== 'notify') return;
 
@@ -205,7 +239,7 @@ async function startBot() {
                            || remoteJid.endsWith('@lid')
                            || altJid.endsWith('@s.whatsapp.net');
       if (!isDirectMessage) {
-        console.log(`[WA]   skipped — not a DM: remoteJid=${remoteJid} altJid=${altJid}`);
+        console.log('[WA] skipped non-direct message');
         continue;
       }
 
@@ -227,7 +261,7 @@ async function startBot() {
       let stepToUse;
       if (!state || isExpired(state)) {
         if (state) {
-          console.log(`[WA ${jid}] EXPIRED (${(now - state.lastSeen) / 1000}s idle) — new cycle`);
+          console.log('[WA] conversation state expired; starting a new cycle');
         }
         const lang = detectLang(text);
         state = { lang, step: 0, lastSeen: now };
@@ -249,7 +283,7 @@ async function startBot() {
 
       // ── Enviar texto ──
       await sock.sendMessage(jid, { text: msgData.text });
-      console.log(`[WA ${jid} lang=${lang} step=${stepToUse}] "${text.slice(0, 40)}" → "${msgData.text.slice(0, 40)}"`);
+      console.log(`[WA] reply sent lang=${lang} step=${stepToUse}`);
 
       // ── Enviar audio (si existe) ──
       const audioBuffer = readAudio(msgData.audio);
@@ -261,18 +295,12 @@ async function startBot() {
             ptt: false, // true = nota de voz
           });
         } catch (err) {
-          console.error(`[WA] Error enviando audio a ${jid}:`, err.message);
+          console.error('[WA] audio delivery failed');
         }
       }
     }
   });
 
-  // ── Mantener proceso vivo ──
-  process.on('SIGINT', () => {
-    console.log('[WA] Cerrando conexión...');
-    sock.end(new Error('SIGINT'));
-    process.exit(0);
-  });
 }
 
 // ── Main ──
@@ -282,7 +310,25 @@ console.log(`📁 Auth: ${AUTH_DIR}`);
 console.log(`🔑 Escanea el QR con tu WhatsApp`);
 console.log('────────────────────────────────────────\n');
 
-startBot().catch(err => {
-  console.error('[WA] Error fatal:', err);
-  process.exit(1);
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  callHealth.record({ type: 'connection', state: 'closed' });
+  console.log(`[WA] Shutting down (${signal})`);
+  try {
+    activeSocket?.end(new Error(signal));
+  } catch {
+    // Process shutdown must continue even if the socket is already closed.
+  }
+  process.exit(0);
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+
+startBot().catch(() => {
+  console.error('[WA] Initial connection setup failed');
+  scheduleReconnect();
 });
