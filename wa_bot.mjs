@@ -15,6 +15,8 @@ import { PersistentInteractionState } from './interaction_state.mjs';
 import { createWhatsAppMessageHandler } from './wa_message_handler.mjs';
 import { KeyedSerialQueue } from './keyed_serial_queue.mjs';
 import { classifyWhatsAppDisconnect } from './wa_disconnect_policy.mjs';
+import { createWhatsAppVoiceNoteReader } from './wa_audio_delivery.mjs';
+import { applyWhatsAppProfilePicture } from './wa_profile_picture.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = path.resolve(process.env.BOT_DIR || __dirname);
@@ -29,10 +31,21 @@ const CALL_HEALTH_FILE = path.resolve(
 const INTERACTION_STATE_FILE = path.resolve(
   process.env.WA_INTERACTION_STATE_FILE || path.join(DATA_DIR, 'wa_interaction_state.json'),
 );
+const VOICE_NOTE_CACHE_DIR = path.resolve(
+  process.env.WA_VOICE_NOTE_CACHE_DIR || path.join(DATA_DIR, 'wa_voice_notes'),
+);
+const PROFILE_PICTURE_PATH = path.resolve(
+  process.env.WA_PROFILE_PICTURE_PATH || path.join(BASE_DIR, 'assets', 'whatsapp-profile-logo.jpg'),
+);
+const PROFILE_PICTURE_STATE_FILE = path.resolve(
+  process.env.WA_PROFILE_PICTURE_STATE_FILE || path.join(DATA_DIR, 'wa_profile_picture_state.json'),
+);
 const IDENTITY_FILE = path.resolve(
   process.env.WA_IDENTITY_FILE || path.join(DATA_DIR, 'wa_identity.json'),
 );
 const LINK_ONLY = process.env.WA_LINK_ONLY === '1';
+const VOICE_NOTES_ENABLED = process.env.WA_VOICE_NOTES_ENABLED !== '0';
+const PROFILE_PICTURE_ENABLED = process.env.WA_PROFILE_PICTURE_ENABLED !== '0';
 const configuredDefaultLanguage = String(process.env.AUTOREPLY_DEFAULT_LANG || 'es').toLowerCase();
 const DEFAULT_LANGUAGE = ['es', 'en', 'fr'].includes(configuredDefaultLanguage)
   ? configuredDefaultLanguage
@@ -198,13 +211,13 @@ function getResponseMessage(lang, responseKey) {
 }
 
 // ── Leer archivo de audio como buffer ──
-function readAudio(filename) {
-  const audioPath = path.join(AUDIO_DIR, filename);
-  if (fs.existsSync(audioPath)) {
-    return fs.readFileSync(audioPath);
-  }
-  return null;
-}
+const readAudio = createWhatsAppVoiceNoteReader({
+  audioDir: AUDIO_DIR,
+  cacheDir: VOICE_NOTE_CACHE_DIR,
+  ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
+  enabled: VOICE_NOTES_ENABLED,
+  logger: console,
+});
 
 // ── Iniciar conexión WhatsApp ──
 async function startBot() {
@@ -325,6 +338,19 @@ async function startBot() {
         writeIdentity(sock.user);
       } catch {
         console.warn('[WA] No fue posible actualizar la identidad mostrable');
+      }
+      if (!LINK_ONLY && PROFILE_PICTURE_ENABLED) {
+        void applyWhatsAppProfilePicture({
+          jid: sock.user?.id,
+          updateProfilePicture: (jid, image, dimensions) => (
+            sock.updateProfilePicture(jid, image, dimensions)
+          ),
+          imagePath: PROFILE_PICTURE_PATH,
+          statePath: PROFILE_PICTURE_STATE_FILE,
+          logger: console,
+        }).catch(() => {
+          console.warn('[WA] La sincronización del logo de perfil falló sin afectar el bot');
+        });
       }
       console.log('[WA] Connected');
     }

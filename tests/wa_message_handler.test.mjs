@@ -89,6 +89,36 @@ test('imagen con descripción cuenta una sola vez y fija el idioma', async () =>
   assert.equal(effects[0][1].text, 'step1');
 });
 
+test('envia OGG/Opus como nota de voz cuando el lector lo proporciona', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-message-handler-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const effects = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async (jid, content) => effects.push([jid, content]),
+    routeInteraction: details => state.register(details),
+    getResponseMessage: () => ({ text: '', audio: 'step1.mp3' }),
+    readAudio: async () => ({
+      buffer: Buffer.from('opus'),
+      mimetype: 'audio/ogg; codecs=opus',
+      ptt: true,
+    }),
+    detectLanguage: () => 'es',
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await handler({
+    type: 'notify',
+    messages: [incoming('voice-note-output', { conversation: 'hola' })],
+  });
+
+  assert.deepEqual(effects[0][1], {
+    audio: Buffer.from('opus'),
+    mimetype: 'audio/ogg; codecs=opus',
+    ptt: true,
+  });
+});
+
 test('el mismo id repetido no responde ni avanza dos veces', async () => {
   const { handler, effects } = createHarness();
   const message = incoming('same', { conversation: 'hola' });

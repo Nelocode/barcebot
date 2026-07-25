@@ -4,6 +4,7 @@ import {
   normalizeMessageContent,
 } from '@whiskeysockets/baileys';
 import { settleWithTimeout } from './keyed_serial_queue.mjs';
+import { toWhatsAppAudioContent } from './wa_audio_delivery.mjs';
 
 const DEFAULT_CONTACT_RESOLUTION_TIMEOUT_MS = 5_000;
 const DEFAULT_SEND_TIMEOUT_MS = 20_000;
@@ -186,14 +187,10 @@ export function createWhatsAppMessageHandler({
 
     if (response.audio) {
       try {
-        const audioBuffer = await readAudio(response.audio);
-        if (audioBuffer) {
+        const audioContent = toWhatsAppAudioContent(await readAudio(response.audio));
+        if (audioContent) {
           await settleWithTimeout(
-            Promise.resolve(sendMessage(jid, {
-              audio: audioBuffer,
-              mimetype: 'audio/mpeg',
-              ptt: false,
-            })),
+            Promise.resolve(sendMessage(jid, audioContent)),
             sendTimeoutMs,
             'El envío de audio de WhatsApp',
           );

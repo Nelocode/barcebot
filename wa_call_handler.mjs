@@ -1,5 +1,6 @@
 import { jidNormalizedUser } from '@whiskeysockets/baileys';
 import { settleWithTimeout } from './keyed_serial_queue.mjs';
+import { toWhatsAppAudioContent } from './wa_audio_delivery.mjs';
 
 const DEFAULT_DEDUPE_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_REJECT_TIMEOUT_MS = 5_000;
@@ -307,14 +308,10 @@ export function createWhatsAppCallHandler({
 
       if (callMessage.audio) {
         try {
-          const audioBuffer = await readAudio(callMessage.audio);
-          if (audioBuffer) {
+          const audioContent = toWhatsAppAudioContent(await readAudio(callMessage.audio));
+          if (audioContent) {
             await settleWithTimeout(
-              Promise.resolve(sendMessage(replyJid, {
-                audio: audioBuffer,
-                mimetype: 'audio/mpeg',
-                ptt: false,
-              })),
+              Promise.resolve(sendMessage(replyJid, audioContent)),
               sendTimeoutMs,
               'El envío de audio de la llamada',
             );

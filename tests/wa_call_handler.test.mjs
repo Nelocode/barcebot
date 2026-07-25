@@ -53,6 +53,24 @@ test('procesa el arreglo de llamadas que entrega Baileys', async () => {
   assert.deepEqual(effects[2][2].audio, Buffer.from('audio'));
 });
 
+test('envia OGG/Opus como nota de voz cuando el lector lo proporciona', async () => {
+  const { handler, effects } = createHarness({
+    readAudio: async () => ({
+      buffer: Buffer.from('opus'),
+      mimetype: 'audio/ogg; codecs=opus',
+      ptt: true,
+    }),
+  });
+
+  await handler([offer()]);
+
+  assert.deepEqual(effects[2][2], {
+    audio: Buffer.from('opus'),
+    mimetype: 'audio/ogg; codecs=opus',
+    ptt: true,
+  });
+});
+
 test('procesa todas las ofertas del mismo lote de forma aislada', async () => {
   const { handler, effects } = createHarness();
 
