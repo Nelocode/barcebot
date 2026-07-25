@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 import { createWhatsAppCallHandler } from '../wa_call_handler.mjs';
+import { PersistentInteractionState } from '../interaction_state.mjs';
 
 function createHarness(overrides = {}) {
   const effects = [];
@@ -192,6 +196,32 @@ test('prefiere callerPn para responder cuando chatId es un LID', async () => {
   assert.equal(outcome.targetKind, 'pn');
 });
 
+test('prefiere from con número antes que un chatId LID', async () => {
+  const { handler, effects } = createHarness();
+
+  await handler([offer({
+    from: '573001234567@s.whatsapp.net',
+    chatId: '12345@lid',
+    callerPn: undefined,
+  })]);
+
+  assert.equal(effects[1][1], '573001234567@s.whatsapp.net');
+  assert.equal(effects[2][1], '573001234567@s.whatsapp.net');
+});
+
+test('normaliza el sufijo de dispositivo al responder una llamada', async () => {
+  const { handler, effects } = createHarness();
+
+  await handler([offer({
+    from: '573001234567:8@s.whatsapp.net',
+    chatId: '573001234567:8@s.whatsapp.net',
+  })]);
+
+  assert.deepEqual(effects[0], ['reject', 'call-1', '573001234567:8@s.whatsapp.net']);
+  assert.equal(effects[1][1], '573001234567@s.whatsapp.net');
+  assert.equal(effects[2][1], '573001234567@s.whatsapp.net');
+});
+
 test('ignora callerPn malformado y cae a chatId', async () => {
   const { handler, effects, metrics } = createHarness();
 
@@ -268,4 +298,124 @@ test('cada rama ignorada emite una razon de cardinalidad cerrada', async () => {
     'group_call',
   ]);
   assert.doesNotMatch(JSON.stringify(outcomes), /573001234567|@s\.whatsapp\.net|call-/);
+});
+
+test('la primera llamada usa CALL y la segunda llamada usa Paso 2', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-state-'));
+  const state = new PersistentInteractionState({
+    filePath: path.join(directory, 'state.json'),
+    logger: { error() {} },
+  });
+  const effects = [];
+  const handler = createWhatsAppCallHandler({
+    rejectCall: async (id, from) => effects.push(['reject', id, from]),
+    sendMessage: async (jid, content) => effects.push(['send', jid, content]),
+    getResponseMessage: (_lang, key) => ({ text: key, audio: `${key}.mp3` }),
+    routeInteraction: details => state.register(details),
+    readAudio: async filename => Buffer.from(filename),
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  const first = await handler([offer({ id: 'call-1' })]);
+  const second = await handler([offer({ id: 'call-2' })]);
+
+  assert.equal(first[0].response, 'call');
+  assert.equal(second[0].response, 'step2');
+  assert.deepEqual(
+    effects.filter(([kind, , content]) => kind === 'send' && content.text)
+      .map(([, , content]) => content.text),
+    ['call', 'step2'],
+  );
+});
+
+test('una llamada posterior a un mensaje también envía Paso 2', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-state-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  state.register({
+    contactId: '573001234567@s.whatsapp.net',
+    eventId: 'message:first',
+    kind: 'content',
+  });
+  const effects = [];
+  const handler = createWhatsAppCallHandler({
+    rejectCall: async () => {},
+    sendMessage: async (jid, content) => effects.push(['send', jid, content]),
+    getResponseMessage: (_lang, key) => ({ text: key, audio: '' }),
+    routeInteraction: details => state.register(details),
+    readAudio: async () => null,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  const result = await handler([offer({ id: 'call-after-message' })]);
+
+  assert.equal(result[0].response, 'step2');
+  assert.equal(effects[0][2].text, 'step2');
+});
+
+test('la deduplicación persistente evita repetir una llamada tras reiniciar', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-state-'));
+  const filePath = path.join(directory, 'state.json');
+  const firstState = new PersistentInteractionState({ filePath });
+  const firstHarness = createWhatsAppCallHandler({
+    rejectCall: async () => {},
+    sendMessage: async () => {},
+    getResponseMessage: (_lang, key) => ({ text: key, audio: '' }),
+    routeInteraction: details => firstState.register(details),
+    readAudio: async () => null,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  await firstHarness([offer()]);
+
+  const effects = [];
+  const reloadedState = new PersistentInteractionState({ filePath });
+  const secondHarness = createWhatsAppCallHandler({
+    rejectCall: async () => effects.push('reject'),
+    sendMessage: async () => effects.push('send'),
+    getResponseMessage: (_lang, key) => ({ text: key, audio: '' }),
+    routeInteraction: details => reloadedState.register(details),
+    readAudio: async () => null,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  const result = await secondHarness([offer()]);
+
+  assert.equal(result[0].reason, 'duplicate');
+  assert.deepEqual(effects, ['reject']);
+});
+
+test('si falla el mapeo LID todavía rechaza y responde la llamada', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-state-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const effects = [];
+  const handler = createWhatsAppCallHandler({
+    rejectCall: async () => effects.push('reject'),
+    sendMessage: async () => effects.push('send'),
+    getResponseMessage: (_lang, key) => ({ text: key, audio: '' }),
+    routeInteraction: details => state.register(details),
+    resolveContactId: async () => { throw new Error('mapping unavailable'); },
+    readAudio: async () => null,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  const result = await handler([offer({ from: '123@lid', chatId: '123@lid' })]);
+
+  assert.equal(result[0].status, 'handled');
+  assert.deepEqual(effects, ['reject', 'send']);
+});
+
+test('si falla el estado la llamada se rechaza de todas formas', async () => {
+  const effects = [];
+  const handler = createWhatsAppCallHandler({
+    rejectCall: async () => effects.push('reject'),
+    sendMessage: async () => effects.push('send'),
+    getResponseMessage: () => ({ text: 'x', audio: '' }),
+    routeInteraction: async () => { throw new Error('disk unavailable'); },
+    readAudio: async () => null,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  const result = await handler([offer()]);
+
+  assert.equal(result[0].reason, 'interaction_state_failed');
+  assert.deepEqual(effects, ['reject']);
 });

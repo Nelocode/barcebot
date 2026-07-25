@@ -1,5 +1,10 @@
+import { jidNormalizedUser } from '@whiskeysockets/baileys';
+import { settleWithTimeout } from './keyed_serial_queue.mjs';
+
 const DEFAULT_DEDUPE_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_REJECT_TIMEOUT_MS = 5_000;
+const DEFAULT_CONTACT_RESOLUTION_TIMEOUT_MS = 5_000;
+const DEFAULT_SEND_TIMEOUT_MS = 20_000;
 const SAFE_EVENT_STATUSES = new Set([
   'offer', 'ringing', 'preaccept', 'transport', 'relaylatency', 'terminate',
   'timeout', 'reject', 'accept', 'other', 'missing',
@@ -17,14 +22,24 @@ function jidKind(jid) {
   return 'other';
 }
 
-function selectReplyTarget(call) {
-  if (jidKind(call?.callerPn) === 'pn') {
-    return { jid: call.callerPn, source: 'caller_pn', kind: 'pn' };
+function normalizeJid(jid) {
+  if (typeof jid !== 'string' || !jid) return '';
+  try {
+    return jidNormalizedUser(jid);
+  } catch {
+    return jid;
   }
+}
+
+function selectReplyTarget(call) {
   const candidates = [
-    ['chat_id', call?.chatId],
-    ['from', call?.from],
+    ['caller_pn', normalizeJid(call?.callerPn)],
+    ['chat_id', normalizeJid(call?.chatId)],
+    ['from', normalizeJid(call?.from)],
   ];
+  for (const [source, jid] of candidates) {
+    if (jidKind(jid) === 'pn') return { jid, source, kind: 'pn' };
+  }
   for (const [source, jid] of candidates) {
     if (typeof jid === 'string' && jid) return { jid, source, kind: jidKind(jid) };
   }
@@ -34,23 +49,6 @@ function selectReplyTarget(call) {
 function pruneHandledCalls(handledCalls, now, ttlMs) {
   for (const [key, handledAt] of handledCalls) {
     if (now - handledAt >= ttlMs) handledCalls.delete(key);
-  }
-}
-
-async function settleWithTimeout(promise, timeoutMs, operation) {
-  let timer;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`${operation} superó ${timeoutMs} ms`)),
-          timeoutMs,
-        );
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
   }
 }
 
@@ -64,19 +62,49 @@ export function createWhatsAppCallHandler({
   rejectCall,
   sendMessage,
   getCallMessage,
+  getResponseMessage = null,
+  routeInteraction = null,
+  resolveContactId = async (jid) => jid,
+  serializeClaim = async operation => operation(),
+  serializeInteraction = async (_contactId, operation) => operation(),
   readAudio,
   getLanguage = () => 'en',
   logger = console,
   now = () => Date.now(),
   dedupeTtlMs = DEFAULT_DEDUPE_TTL_MS,
   rejectTimeoutMs = DEFAULT_REJECT_TIMEOUT_MS,
+  contactResolutionTimeoutMs = DEFAULT_CONTACT_RESOLUTION_TIMEOUT_MS,
+  sendTimeoutMs = DEFAULT_SEND_TIMEOUT_MS,
   handledCalls = new Map(),
   onCallMetric = () => {},
 }) {
   if (typeof rejectCall !== 'function') throw new TypeError('rejectCall es requerido');
   if (typeof sendMessage !== 'function') throw new TypeError('sendMessage es requerido');
-  if (typeof getCallMessage !== 'function') throw new TypeError('getCallMessage es requerido');
+  if (typeof getCallMessage !== 'function' && typeof getResponseMessage !== 'function') {
+    throw new TypeError('getCallMessage o getResponseMessage es requerido');
+  }
+  if (routeInteraction !== null && typeof routeInteraction !== 'function') {
+    throw new TypeError('routeInteraction debe ser una función');
+  }
+  if (routeInteraction && typeof getResponseMessage !== 'function') {
+    throw new TypeError('getResponseMessage es requerido con routeInteraction');
+  }
+  if (typeof resolveContactId !== 'function') {
+    throw new TypeError('resolveContactId debe ser una función');
+  }
+  if (typeof serializeClaim !== 'function') {
+    throw new TypeError('serializeClaim debe ser una función');
+  }
+  if (typeof serializeInteraction !== 'function') {
+    throw new TypeError('serializeInteraction debe ser una función');
+  }
   if (typeof readAudio !== 'function') throw new TypeError('readAudio es requerido');
+  if (!Number.isFinite(contactResolutionTimeoutMs) || contactResolutionTimeoutMs <= 0) {
+    throw new TypeError('contactResolutionTimeoutMs debe ser positivo');
+  }
+  if (!Number.isFinite(sendTimeoutMs) || sendTimeoutMs <= 0) {
+    throw new TypeError('sendTimeoutMs debe ser positivo');
+  }
 
   function emitMetric(metric) {
     try {
@@ -110,6 +138,24 @@ export function createWhatsAppCallHandler({
       targetKind: delivery.targetKind || 'not_applicable',
     });
     return result;
+  }
+
+  async function rejectIncomingCall(call) {
+    if (call.offline) {
+      logger.info?.('[WA CALL] Offline offer; rejection skipped');
+      return 'skipped_offline';
+    }
+    try {
+      await settleWithTimeout(
+        Promise.resolve(rejectCall(call.id, call.from)),
+        rejectTimeoutMs,
+        'El rechazo de la llamada',
+      );
+      return 'sent';
+    } catch {
+      logger.error?.('[WA CALL] Call rejection failed');
+      return 'failed';
+    }
   }
 
   async function handleOneCall(call) {
@@ -147,84 +193,155 @@ export function createWhatsAppCallHandler({
 
     // Reclamar el evento antes del primer await evita respuestas simultáneas.
     handledCalls.set(dedupeKey, currentTime);
+    const rejectionPromise = rejectIncomingCall(call);
 
     // Prefer the phone-number JID. Sending to a LID can resolve without the
     // recipient receiving or synchronizing the message on all devices.
     const replyTarget = selectReplyTarget(call);
     const replyJid = replyTarget.jid;
-    const result = {
-      status: 'handled',
-      callId: call.id,
+    const contactAliases = [
       replyJid,
-      reject: 'pending',
-      text: 'skipped',
-      audio: 'skipped',
+      normalizeJid(call.callerPn),
+      normalizeJid(call.chatId),
+      normalizeJid(call.from),
+    ].filter(Boolean);
+
+    let claimed;
+    try {
+      claimed = await serializeClaim(async () => {
+        let contactId = replyJid;
+        try {
+          contactId = await settleWithTimeout(
+            Promise.resolve(resolveContactId(replyJid, call)),
+            contactResolutionTimeoutMs,
+            'La resolución de identidad de la llamada',
+          ) || replyJid;
+        } catch {
+          logger.warn?.('[WA CALL] Contact mapping failed; using reply target');
+        }
+
+        let interactionDecision = null;
+        if (routeInteraction) {
+          interactionDecision = await routeInteraction({
+            contactId,
+            contactAliases,
+            eventId: `call:${call.id}`,
+            kind: 'call',
+            detectedLanguage: null,
+          });
+        }
+        return { contactId, interactionDecision };
+      });
+    } catch {
+      logger.error?.('[WA CALL] Interaction state failed');
+      const failedResult = {
+        status: 'failed',
+        reason: 'interaction_state_failed',
+        reject: await rejectionPromise,
+      };
+      return finish(call, failedResult, 'interaction_state_failed', {
+        ...failedResult,
+        targetSource: replyTarget.source,
+        targetKind: replyTarget.kind,
+      });
+    }
+
+    const interactionDecision = claimed.interactionDecision;
+    if (interactionDecision?.duplicate) {
+      logger.info?.('[WA CALL] Persisted duplicate offer ignored');
+      const duplicateResult = {
+        status: 'ignored',
+        reason: 'duplicate',
+        reject: await rejectionPromise,
+      };
+      return finish(call, duplicateResult, 'duplicate', {
+        ...duplicateResult,
+        targetSource: replyTarget.source,
+        targetKind: replyTarget.kind,
+      });
+    }
+
+    const deliveryKey = interactionDecision?.contactKey || claimed.contactId;
+    const delivery = await serializeInteraction(deliveryKey, async () => {
+      const result = {
+        status: 'handled',
+        callId: call.id,
+        replyJid,
+        reject: 'pending',
+        text: 'skipped',
+        audio: 'skipped',
+        targetSource: replyTarget.source,
+        targetKind: replyTarget.kind,
+        response: interactionDecision?.responseKey || (routeInteraction ? 'none' : 'call'),
+      };
+
+      logger.info?.(`[WA CALL] Offer received${call.isVideo ? ' (video)' : ''}`);
+      let language = 'en';
+      let callMessage = {};
+      try {
+        if (interactionDecision) {
+          language = interactionDecision.language || 'es';
+          callMessage = getResponseMessage(language, interactionDecision.responseKey) || {};
+        } else {
+          language = getLanguage(call, replyJid) || 'en';
+          callMessage = getCallMessage(language) || {};
+        }
+      } catch {
+        logger.error?.('[WA CALL] Response preparation failed');
+      }
+
+      const text = typeof callMessage.text === 'string' ? callMessage.text.trim() : '';
+      if (text) {
+        try {
+          await settleWithTimeout(
+            Promise.resolve(sendMessage(replyJid, { text })),
+            sendTimeoutMs,
+            'El envío de texto de la llamada',
+          );
+          result.text = 'sent';
+        } catch {
+          result.text = 'failed';
+          logger.error?.('[WA CALL] Text delivery failed');
+        }
+      }
+
+      if (callMessage.audio) {
+        try {
+          const audioBuffer = await readAudio(callMessage.audio);
+          if (audioBuffer) {
+            await settleWithTimeout(
+              Promise.resolve(sendMessage(replyJid, {
+                audio: audioBuffer,
+                mimetype: 'audio/mpeg',
+                ptt: false,
+              })),
+              sendTimeoutMs,
+              'El envío de audio de la llamada',
+            );
+            result.audio = 'sent';
+          } else {
+            result.audio = 'missing';
+          }
+        } catch {
+          result.audio = 'failed';
+          logger.error?.('[WA CALL] Audio delivery failed');
+        }
+      }
+      return { reason: 'completed', result, language };
+    });
+
+    delivery.result.reject = await rejectionPromise;
+    if (delivery.reason === 'completed') {
+      logger.info?.(
+        `[WA CALL] ${delivery.language.toUpperCase()} response completed ` +
+        `type=${delivery.result.response}`,
+      );
+    }
+    return finish(call, delivery.result, delivery.reason, {
+      ...delivery.result,
       targetSource: replyTarget.source,
       targetKind: replyTarget.kind,
-    };
-
-    logger.info?.(`[WA CALL] Offer received${call.isVideo ? ' (video)' : ''}`);
-
-    if (call.offline) {
-      // Una oferta recibida desde la cola ya no representa una llamada activa.
-      // Conservamos el aviso automático, pero evitamos un rechazo inútil.
-      result.reject = 'skipped_offline';
-      logger.info?.('[WA CALL] Offline offer; rejection skipped');
-    } else {
-      try {
-        await settleWithTimeout(
-          Promise.resolve(rejectCall(call.id, call.from)),
-          rejectTimeoutMs,
-          'El rechazo de la llamada',
-        );
-        result.reject = 'sent';
-      } catch (error) {
-        result.reject = 'failed';
-        logger.error?.('[WA CALL] Call rejection failed');
-      }
-    }
-
-    let lang = 'en';
-    let callMessage = {};
-    try {
-      lang = getLanguage(call, replyJid) || 'en';
-      callMessage = getCallMessage(lang) || {};
-    } catch (error) {
-      logger.error?.('[WA CALL] Response preparation failed');
-    }
-
-    const text = typeof callMessage.text === 'string' ? callMessage.text.trim() : '';
-    if (text) {
-      try {
-        await sendMessage(replyJid, { text });
-        result.text = 'sent';
-      } catch (error) {
-        result.text = 'failed';
-        logger.error?.('[WA CALL] Text delivery failed');
-      }
-    }
-
-    if (callMessage.audio) {
-      try {
-        const audioBuffer = await readAudio(callMessage.audio);
-        if (audioBuffer) {
-          await sendMessage(replyJid, {
-            audio: audioBuffer,
-            mimetype: 'audio/mpeg',
-            ptt: false,
-          });
-          result.audio = 'sent';
-        } else {
-          result.audio = 'missing';
-        }
-      } catch (error) {
-        result.audio = 'failed';
-        logger.error?.('[WA CALL] Audio delivery failed');
-      }
-    }
-
-    logger.info?.(`[WA CALL] ${lang.toUpperCase()} response completed`);
-    return finish(call, result, 'completed', result);
+    });
   }
 
   return async function handleCallBatch(payload) {
@@ -241,10 +358,9 @@ export function createWhatsAppCallHandler({
       return [];
     }
 
-    const results = [];
-    for (const call of calls) {
+    return Promise.all(calls.map(async (call) => {
       try {
-        results.push(await handleOneCall(call));
+        return await handleOneCall(call);
       } catch (error) {
         logger.error?.('[WA CALL] Unexpected handler failure');
         emitMetric({
@@ -258,9 +374,8 @@ export function createWhatsAppCallHandler({
           target: 'not_applicable',
           targetKind: 'not_applicable',
         });
-        results.push({ status: 'failed', reason: 'unexpected_error' });
+        return { status: 'failed', reason: 'unexpected_error' };
       }
-    }
-    return results;
+    }));
   };
 }

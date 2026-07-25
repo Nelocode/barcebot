@@ -17,10 +17,16 @@ mkdir -p /app/data/audios /app/data/wa_auth
 # Copiar defaults si no existen en data/
 [ -f /app/data/messages.json ] || cp /app/messages.json /app/data/messages.json
 [ -f /app/data/.env.local ] || touch /app/data/.env.local
-# Copiar audios por defecto si data/audios está vacío
-if [ -z "$(ls -A /app/data/audios 2>/dev/null)" ]; then
-    cp -r /app/audios/* /app/data/audios/ 2>/dev/null || true
-fi
+python /app/message_schema.py /app/data/messages.json /app/messages.json
+# Sembrar sólo los audios que falten; nunca sobrescribir los personalizados.
+for source_audio in /app/audios/*; do
+    [ -f "$source_audio" ] || continue
+    destination_audio="/app/data/audios/$(basename "$source_audio")"
+    [ -f "$destination_audio" ] || cp "$source_audio" "$destination_audio"
+done
+# Corregir únicamente el M4A histórico conocido que tenía extensión .mp3.
+# El migrador compara hashes, crea respaldo y no toca audios personalizados.
+python /app/audio_migrations.py /app/data/audios /app/audios
 
 # ── 1. Bot Telegram (User Bot - Telethon) ────────────────────────────
 # Cargar credenciales desde .env.local si no están en environment

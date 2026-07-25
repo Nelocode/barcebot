@@ -12,12 +12,6 @@
         "step": 2,
         "text": "⏳ Gracias por esperar. Ya estamos asignando un agente para ti.",
         "audio": "es_msg2.mp3",
-        "loop": false
-      },
-      {
-        "step": 3,
-        "text": "🔄 Tu solicitud es importante. Por favor permanece en línea.",
-        "audio": "es_msg3.mp3",
         "loop": true
       }
     ],
@@ -39,12 +33,6 @@
         "step": 2,
         "text": "⏳ Thank you for waiting. We are assigning an agent for you.",
         "audio": "en_msg2.mp3",
-        "loop": false
-      },
-      {
-        "step": 3,
-        "text": "🔄 Your request matters to us. Please stay on the line.",
-        "audio": "en_msg3.mp3",
         "loop": true
       }
     ],
@@ -66,12 +54,6 @@
         "step": 2,
         "text": "⏳ Merci d avoir patienté. Nous assignons un agent pour vous.",
         "audio": "fr_msg2.mp3",
-        "loop": false
-      },
-      {
-        "step": 3,
-        "text": "🔄 Votre demande est importante pour nous. Veuillez rester en ligne.",
-        "audio": "fr_msg3.mp3",
         "loop": true
       }
     ],

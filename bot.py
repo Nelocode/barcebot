@@ -1,90 +1,110 @@
-"""
-Bot AutoReply Comercial — Telegram (User Bot via Telethon)
-Flujo: mensaje inicial → msg1+audio → msg2+audio → loop msg3+audio
-Idioma se detecta UNA VEZ al inicio y se queda fijo.
-Timeout de 1 hora sin actividad resetea el estado.
+"""Bot AutoReply comercial para una cuenta de usuario de Telegram.
 
-User bot = sin /start, como un usuario normal.
-Credenciales desde env vars o .env.local.
+Reglas de conversación:
+* primera llamada real: mensaje y audio de llamada;
+* primer texto o multimedia: Paso 1;
+* texto o multimedia posterior: Paso 2, sin límite;
+* cualquier interacción posterior, incluida una llamada, recibe Paso 2.
+
+El estado se persiste y los eventos se reclaman antes de enviar para evitar
+respuestas dobles durante reconexiones o despliegues.
 """
-import os
-import re
-import json
-import time
+
 import asyncio
+import json
 import logging
+import os
 from pathlib import Path
+import re
+import time
 
 from telethon import TelegramClient, events
-from telethon.tl.types import MessageMediaDocument
-from telethon.errors import SessionPasswordNeededError
+from telethon.tl import types
 
-# ── Config ────────────────────────────────────────────────────────────
+from interaction_state import PersistentInteractionState
+from message_schema import load_message_file
+from telegram_events import (
+    missed_call_interaction,
+    new_message_interaction,
+    requested_call_interaction,
+)
+from telegram_dispatcher import TelegramInteractionDispatcher
+
+
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audios"
 MESSAGES_FILE = DATA_DIR / "messages.json"
-SESSION_FILE = str(DATA_DIR / "tg_session")  # Telethon session
+DEFAULT_MESSAGES_FILE = BASE_DIR / "messages.json"
+SESSION_FILE = str(DATA_DIR / "tg_session")
 HEALTH_FILE = DATA_DIR / "tg_userbot_health.json"
 AUTHORIZED_MARKER_FILE = DATA_DIR / "tg_session_authorized.json"
+INTERACTION_STATE_FILE = DATA_DIR / "tg_interaction_state.json"
+TELEGRAM_SEND_TIMEOUT_SECONDS = 20
 
-RESET_TIMEOUT = 3600  # 1 hora
 
-# Credenciales: de env vars o .env.local
-API_ID = os.environ.get("TG_API_ID")
-API_HASH = os.environ.get("TG_API_HASH")
-PHONE = os.environ.get("TG_PHONE")
-
-def _load_env_file():
-    """Carga vars desde data/.env.local si no están en environment."""
+def _load_env_file() -> None:
+    """Carga únicamente las credenciales permitidas desde data/.env.local."""
     env_file = DATA_DIR / ".env.local"
     if not env_file.exists():
         return
-    with open(env_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
+    with env_file.open("r", encoding="utf-8") as file_handle:
+        for raw_line in file_handle:
+            line = raw_line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            key, _, val = line.partition("=")
-            key, val = key.strip(), val.strip().strip('"').strip("'")
-            if key in ("TG_API_ID", "TG_API_HASH", "TG_PHONE") and val:
-                os.environ[key] = val
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key in {"TG_API_ID", "TG_API_HASH", "TG_PHONE"} and value:
+                os.environ[key] = value
+
 
 _load_env_file()
 
-# Re-leer después de cargar .env.local
 API_ID = int(os.environ["TG_API_ID"]) if os.environ.get("TG_API_ID") else None
 API_HASH = os.environ.get("TG_API_HASH")
 PHONE = os.environ.get("TG_PHONE")
+DEFAULT_LANGUAGE = os.environ.get("AUTOREPLY_DEFAULT_LANG", "es").lower()
+if DEFAULT_LANGUAGE not in {"es", "en", "fr"}:
+    DEFAULT_LANGUAGE = "es"
 
 if not API_ID or not API_HASH:
     raise RuntimeError(
         "Credenciales de user bot no configuradas.\n"
-        "Configura TG_API_ID, TG_API_HASH, y TG_PHONE en el panel."
+        "Configura TG_API_ID, TG_API_HASH y TG_PHONE en el panel."
     )
 
-# ── Mensajes ───────────────────────────────────────────────────────────
+
 def load_messages() -> dict:
-    with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    data = load_message_file(MESSAGES_FILE, DEFAULT_MESSAGES_FILE)
     result = {}
-    for lang, lang_data in data.items():
-        steps = lang_data.get("steps", [])
-        result[lang] = {
-            "steps": [(s["text"], s["audio"], s.get("loop", False)) for s in steps],
-            "call": lang_data.get("call", {"text": "📞 Llamada recibida", "audio": ""})
+    for language, language_data in data.items():
+        steps = language_data.get("steps", [])
+        result[language] = {
+            "steps": [
+                (step.get("text", ""), step.get("audio", ""), bool(step.get("loop")))
+                for step in steps
+            ],
+            "call": language_data.get(
+                "call",
+                {"text": "📞 Llamada recibida", "audio": ""},
+            ),
         }
     return result
 
+
 MESSAGES = load_messages()
+interaction_state = PersistentInteractionState(
+    INTERACTION_STATE_FILE,
+    default_language=DEFAULT_LANGUAGE,
+)
 
-# ── Estado por usuario ────────────────────────────────────────────────
-user_state: dict[int, dict] = {}
 
-# ── Detección de idioma ───────────────────────────────────────────────
 LANG_KEYWORDS = {
     "es": re.compile(
         r"\b(hola|gracias|por\s*favor|buenos\s*días|quiero|necesito|ayuda|habla|"
+        r"precio|precios|tarifa|tarifas|reserva|reservas|foto|fotos|vídeo|vídeos|video|videos|"
         r"buenas|amigo|claro|vale|dale|listo|entiendo|puedes|hacer|"
         r"dónde|cuándo|cómo|cuál|quién|eso|esto|algo|nada|todo|más|menos|"
         r"está|estoy|estamos|están|tengo|tiene|tenemos|soy|eres|somos|son)\b",
@@ -92,6 +112,7 @@ LANG_KEYWORDS = {
     ),
     "en": re.compile(
         r"\b(hello|hi|thanks|thank\s*you|please|help|want|need|can\s*i|"
+        r"price|prices|rate|rates|book|booking|photo|photos|video|videos|"
         r"yes|sure|fine|good|great|hey|would|could|should|"
         r"where|when|how|what|who|that|this|there|here|"
         r"is|are|am|have|has|do|does|did|will|may|might)\b",
@@ -99,73 +120,90 @@ LANG_KEYWORDS = {
     ),
     "fr": re.compile(
         r"\b(bonjour|merci|s'il\s*vous\s*plaît|aide|besoin|vouloir|"
-        r"oui|d'accord|bien|tres|peux|peut|"
-        r"où|quand|comment|quoi|qui|que|"
+        r"prix|tarif|tarifs|réservation|réserver|photo|photos|vidéo|vidéos|"
+        r"oui|d'accord|bien|tres|peux|peut|où|quand|comment|quoi|qui|que|"
         r"est|suis|sommes|êtes|sont|ai|as|a|avons|avez|ont|"
         r"je|tu|il|elle|nous|vous|ils|elles|"
         r"ce|cet|cette|ces|mon|ton|son|ma|ta|sa)\b",
         re.IGNORECASE,
     ),
 }
+AMBIGUOUS = {"ok", "no", "si", "hey"}
+LANG_MARKERS = {
+    "es": re.compile(r"\b(español|castellano|hablo español|hablo espanol)\b", re.IGNORECASE),
+    "en": re.compile(r"\b(english|speak english)\b", re.IGNORECASE),
+    "fr": re.compile(r"\b(français|francais|parle français|parle francais)\b", re.IGNORECASE),
+}
 
-AMBIGUOUS = {"ok", "no", "si", "hey", "hi", "hello"}
 
-
-def detect_lang(text: str) -> str:
-    scores = {"es": 0, "en": 0, "fr": 0}
-    for lang, pattern in LANG_KEYWORDS.items():
-        matches = pattern.findall(text)
-        for m in matches:
-            if m.lower() not in AMBIGUOUS:
-                scores[lang] += 1.0
-    lang_markers = {
-        "es": re.compile(r"\b(español|castellano|hablo español|hablo espanol)\b", re.IGNORECASE),
-        "en": re.compile(r"\b(english|speak english)\b", re.IGNORECASE),
-        "fr": re.compile(r"\b(français|francais|parle français|parle francais)\b", re.IGNORECASE),
-    }
-    for lang, marker in lang_markers.items():
+def detect_lang(text: str) -> str | None:
+    scores = {"es": 0.0, "en": 0.0, "fr": 0.0}
+    for language, pattern in LANG_KEYWORDS.items():
+        for match in pattern.findall(text):
+            if match.lower() not in AMBIGUOUS:
+                scores[language] += 1.0
+    for language, marker in LANG_MARKERS.items():
         if marker.search(text):
-            scores[lang] += 20
+            scores[language] += 20
     if max(scores.values()) < 1:
-        return "en"
+        return None
     return max(scores, key=scores.get)
 
 
-def is_expired(state: dict) -> bool:
-    return time.time() - state.get("last_seen", 0) > RESET_TIMEOUT
-
-
-def load_messages_fresh():
-    """Recarga mensajes desde disco (para cambios desde el panel)."""
+def load_messages_fresh() -> None:
     global MESSAGES
     try:
         MESSAGES = load_messages()
     except Exception:
-        pass
+        logging.exception("No se pudo recargar messages.json; se conserva la versión anterior")
 
 
-# ── Cliente Telethon ───────────────────────────────────────────────────
+def _language_data(language: str) -> dict:
+    if language in MESSAGES:
+        return MESSAGES[language]
+    if DEFAULT_LANGUAGE in MESSAGES:
+        return MESSAGES[DEFAULT_LANGUAGE]
+    if "en" in MESSAGES:
+        return MESSAGES["en"]
+    return next(iter(MESSAGES.values()), {"steps": [], "call": {}})
+
+
+def get_response_message(language: str, response_key: str) -> tuple[str, str]:
+    language_data = _language_data(language)
+    if response_key == "call":
+        call_data = language_data.get("call", {})
+        return call_data.get("text", ""), call_data.get("audio", "")
+
+    steps = language_data.get("steps", [])
+    if not steps:
+        return "", ""
+    index = 0 if response_key == "step1" else min(1, len(steps) - 1)
+    text, audio, _loop = steps[index]
+    return text, audio
+
+
 client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+self_user_id: int | None = None
 
 
 def write_health(ready: bool) -> None:
     """Publica un heartbeat mínimo, sin teléfono ni identidad de la cuenta."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    temp_file = HEALTH_FILE.with_suffix(".tmp")
-    temp_file.write_text(
+    temporary_file = HEALTH_FILE.with_suffix(".tmp")
+    temporary_file.write_text(
         json.dumps({"ready": ready, "updated_at": time.time()}),
         encoding="utf-8",
     )
-    os.replace(temp_file, HEALTH_FILE)
+    os.replace(temporary_file, HEALTH_FILE)
 
 
 def write_authorized_marker() -> None:
-    temp_file = AUTHORIZED_MARKER_FILE.with_suffix(".tmp")
-    temp_file.write_text(
+    temporary_file = AUTHORIZED_MARKER_FILE.with_suffix(".tmp")
+    temporary_file.write_text(
         json.dumps({"authorized": True, "updated_at": time.time()}),
         encoding="utf-8",
     )
-    os.replace(temp_file, AUTHORIZED_MARKER_FILE)
+    os.replace(temporary_file, AUTHORIZED_MARKER_FILE)
 
 
 async def heartbeat() -> None:
@@ -174,102 +212,109 @@ async def heartbeat() -> None:
         await asyncio.sleep(15)
 
 
-# ── Handlers ───────────────────────────────────────────────────────────
+async def send_response(chat_id: int, response_key: str, language: str) -> None:
+    load_messages_fresh()
+    message_text, audio_file = get_response_message(language, response_key)
 
-@client.on(events.NewMessage(incoming=True))
-async def handle_message(event):
-    """Maneja mensajes de texto entrantes (sin /start necesario)."""
-    # Solo chats privados (no grupos/canales)
-    if not event.is_private:
-        return
-
-    chat_id = event.chat_id
-    text = (event.message.message or "").strip()
-    if not text:
-        return
-
-    now = time.time()
-    state = user_state.get(chat_id)
-
-    # ── Comandos especiales ──
-    if text.startswith("/start") or text.startswith("/"):
-        return  # Ignorar comandos, sin respuesta
-
-    # ── Nuevo ciclo o expired ──
-    if state is None or is_expired(state):
-        if state is not None:
-            logging.info("[chat=%s] EXPIRED — new cycle", chat_id)
-        load_messages_fresh()
-        detected = detect_lang(text)
-        state = {"lang": detected, "step": 0, "last_seen": now}
-        user_state[chat_id] = state
-        step_to_use = 0
-    else:
-        step_to_use = min(state["step"] + 1, len(MESSAGES.get(state["lang"], MESSAGES["en"])["steps"]) - 1)
-        state["last_seen"] = now
-
-    lang = state["lang"]
-    lang_data = MESSAGES.get(lang, MESSAGES["en"])
-    msg_text, audio_file, is_loop = lang_data["steps"][step_to_use]
-
-    # Solo avanzar step si NO es loop
-    if not is_loop:
-        state["step"] = step_to_use
-    # Si es loop, state["step"] se queda donde estaba
-
-    # Enviar texto
-    await client.send_message(chat_id, msg_text)
-
-    # Enviar audio
-    audio_path = AUDIO_DIR / audio_file
-    if audio_path.exists():
-        await client.send_file(chat_id, str(audio_path), voice_note=False)
-
-    logging.info(
-        "[chat=%s lang=%s step=%s] %r → %r",
-        chat_id, lang, step_to_use, text[:60], msg_text[:60],
-    )
-
-
-@client.on(events.NewMessage(incoming=True, func=lambda e: e.voice or e.video_note))
-async def handle_media_call(event):
-    """Responde a notas de voz / video (simula manejo de 'llamada')."""
-    if not event.is_private:
-        return
-
-    chat_id = event.chat_id
-    logging.info("[chat=%s] VOICE/VIDEO (call-like) received", chat_id)
-
-    state = user_state.get(chat_id)
-    if state and not is_expired(state):
-        lang = state["lang"]
-    else:
-        lang = "en"
-
-    lang_data = MESSAGES.get(lang, MESSAGES["en"])
-    call_data = lang_data.get("call", {"text": "📞 Llamada recibida", "audio": ""})
-    msg_text = call_data.get("text", "📞 Llamada recibida")
-    audio_file = call_data.get("audio", "")
-
-    try:
-        await client.send_message(chat_id, msg_text)
-    except Exception:
-        pass
+    if message_text:
+        try:
+            await asyncio.wait_for(
+                client.send_message(chat_id, message_text),
+                timeout=TELEGRAM_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            logging.exception("Telegram text delivery failed")
 
     if audio_file:
         audio_path = AUDIO_DIR / audio_file
         if audio_path.exists():
             try:
-                await client.send_file(chat_id, str(audio_path), voice_note=False)
+                await asyncio.wait_for(
+                    client.send_file(chat_id, str(audio_path), voice_note=False),
+                    timeout=TELEGRAM_SEND_TIMEOUT_SECONDS,
+                )
             except Exception:
-                pass
+                logging.exception("Telegram audio delivery failed")
+        else:
+            logging.error("Telegram audio file is missing: %s", audio_file)
 
-    logging.info("[chat=%s lang=%s] CALL reply sent", chat_id, lang)
+
+telegram_dispatcher = TelegramInteractionDispatcher(interaction_state, send_response)
 
 
-# ── Main ──────────────────────────────────────────────────────────────
+async def process_interaction(
+    *,
+    chat_id: int,
+    event_id: str,
+    kind: str,
+    detected_language: str | None = None,
+) -> None:
+    decision = await telegram_dispatcher.dispatch(
+        chat_id=chat_id,
+        event_id=event_id,
+        kind=kind,
+        detected_language=detected_language,
+    )
+    if decision.duplicate:
+        logging.info("Telegram duplicate interaction ignored")
+        return
+    if not decision.persisted:
+        logging.warning("Telegram interaction is only stored in memory")
+    logging.info(
+        "Telegram interaction processed kind=%s phase=%s response=%s lang=%s",
+        kind,
+        decision.phase,
+        decision.response_key,
+        decision.language,
+    )
 
-async def main():
+
+@client.on(events.NewMessage(incoming=True))
+async def handle_message(event) -> None:
+    """Maneja una vez cada texto, voz, imagen, documento o multimedia."""
+    interaction = new_message_interaction(
+        event.message,
+        chat_id=event.chat_id,
+        is_private=event.is_private,
+    )
+    if not interaction:
+        return
+    await process_interaction(
+        chat_id=interaction.contact_id,
+        event_id=interaction.event_id,
+        kind=interaction.kind,
+        detected_language=detect_lang(interaction.text) if interaction.text else None,
+    )
+
+
+@client.on(events.Raw(types.UpdatePhoneCall))
+async def handle_phone_call(update) -> None:
+    """Cuenta solicitudes de llamadas reales, no notas de voz."""
+    interaction = requested_call_interaction(update, self_user_id=self_user_id)
+    if not interaction:
+        return
+    await process_interaction(
+        chat_id=interaction.contact_id,
+        event_id=interaction.event_id,
+        kind=interaction.kind,
+    )
+
+
+@client.on(events.Raw(types.UpdateNewMessage))
+async def handle_missed_call_service(update) -> None:
+    """Fallback para una llamada perdida recibida después de reconectar."""
+    interaction = missed_call_interaction(update, self_user_id=self_user_id)
+    if not interaction:
+        return
+    await process_interaction(
+        chat_id=interaction.contact_id,
+        event_id=interaction.event_id,
+        kind=interaction.kind,
+    )
+
+
+async def main() -> None:
+    global self_user_id
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(message)s",
         level=logging.INFO,
@@ -279,8 +324,12 @@ async def main():
     await client.connect()
     if not await client.is_user_authorized():
         AUTHORIZED_MARKER_FILE.unlink(missing_ok=True)
-        raise RuntimeError("La sesión de Telegram no está autorizada; completa la vinculación en el panel.")
+        raise RuntimeError(
+            "La sesión de Telegram no está autorizada; completa la vinculación en el panel."
+        )
 
+    me = await client.get_me()
+    self_user_id = me.id
     write_authorized_marker()
     logging.info("Telegram session authorized; user bot ready.")
     write_health(True)

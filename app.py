@@ -16,11 +16,13 @@ from datetime import timedelta
 from pathlib import Path
 from flask import Flask, render_template_string, request, jsonify, send_from_directory, session
 from telegram_auth import TelegramAuthManager
+from message_schema import load_message_file
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audios"
 MESSAGES_FILE = DATA_DIR / "messages.json"
+DEFAULT_MESSAGES_FILE = BASE_DIR / "messages.json"
 WA_CALL_HEALTH_FILE = DATA_DIR / "wa_call_health.json"
 
 def _load_or_create_flask_secret() -> str:
@@ -319,27 +321,24 @@ function renderSteps(data) {
 
   let html = `<div class="card">
     <div class="card-header d-flex justify-content-between align-items-center">
-      <span><span class="badge badge-${lang}">${LANG_CODES[lang]}</span> ${LANG_NAMES[lang]} — 3 pasos</span>
+      <span><span class="badge badge-${lang}">${LANG_CODES[lang]}</span> ${LANG_NAMES[lang]} — 2 pasos fijos</span>
       <div>
-        <button class="btn btn-sm btn-outline-secondary" onclick="addStep('${lang}')">+ Añadir Paso</button>
         <button class="btn btn-sm btn-outline-primary" onclick="previewLang('${lang}')">👁 Vista previa</button>
       </div>
     </div>
     <div class="card-body">`;
 
-  langData.steps.forEach((step, i) => {
+  langData.steps.slice(0, 2).forEach((step, i) => {
     const audioPath = `/api/audio/${step.audio}`;
     html += `
     <div class="mb-4 p-3" style="background:#141428; border-radius:8px;" data-step="${i}">
       <div class="d-flex justify-content-between align-items-center mb-2">
         <div class="d-flex align-items-center gap-2">
           <span class="step-label">Paso ${i+1}</span>
-          <label class="small mb-0" style="cursor:pointer;color:#aaa;">
-            <input type="checkbox" ${step.loop ? 'checked' : ''} onchange="saveStepLoop('${lang}', ${i}, this.checked)" style="accent-color:#6ea8fe;">
-            🔁 Loop
-          </label>
+          <span class="small text-muted">${i === 0
+            ? 'Primera interacción si no fue llamada'
+            : '🔁 Loop desde la interacción 2, incluidas llamadas'}</span>
         </div>
-        <button class="btn btn-sm btn-danger" onclick="removeStep('${lang}', ${i})">✕</button>
       </div>
       <div class="row g-3">
         <div class="col-md-8">
@@ -967,8 +966,7 @@ body { background: #17212b; color: #e0e0e0; font-family: system-ui; margin: 0; p
 # ── API Routes ────────────────────────────────────────────────────────
 
 def load_messages_json():
-    with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return load_message_file(MESSAGES_FILE, DEFAULT_MESSAGES_FILE, persist=True)
 
 def save_messages_json(data):
     with open(MESSAGES_FILE, "w", encoding="utf-8") as f:
@@ -1206,7 +1204,7 @@ def preview(lang):
     return render_template_string(
         PREVIEW_TEMPLATE,
         lang_name=lang_data.get("lang_name", lang.upper()),
-        steps=lang_data.get("steps", [])
+        steps=lang_data.get("steps", [])[:2]
     )
 
 @app.route("/api/data")
@@ -1423,25 +1421,16 @@ def api_messages():
         return jsonify({"ok": True})
 
     elif action == "add_step":
-        step_num = len(steps) + 1
-        audio_file = f"{lang}_msg{step_num}.mp3"
-        steps.append({
-            "step": step_num,
-            "text": f"Nuevo mensaje {step_num}",
-            "audio": audio_file
-        })
-        save_messages_json(messages)
-        return jsonify({"ok": True})
+        return jsonify({
+            "ok": False,
+            "error": "El flujo usa exactamente Paso 1 y Paso 2 en loop"
+        }), 400
 
     elif action == "remove_step":
-        step = data.get("step")
-        if step is None or step < 0 or step >= len(steps):
-            return jsonify({"ok": False, "error": "Invalid step"}), 400
-        if len(steps) <= 1:
-            return jsonify({"ok": False, "error": "Debe haber al menos 1 paso"}), 400
-        removed = steps.pop(step)
-        save_messages_json(messages)
-        return jsonify({"ok": True, "removed": removed})
+        return jsonify({
+            "ok": False,
+            "error": "Paso 1 y Paso 2 son obligatorios en este flujo"
+        }), 400
 
     elif action == "edit_call_text":
         text = data.get("text", "").strip()

@@ -11,6 +11,9 @@ import { Boom } from '@hapi/boom';
 import QRCode from 'qrcode';
 import { createWhatsAppCallHandler } from './wa_call_handler.mjs';
 import { createWhatsAppCallHealth } from './wa_call_health.mjs';
+import { PersistentInteractionState } from './interaction_state.mjs';
+import { createWhatsAppMessageHandler } from './wa_message_handler.mjs';
+import { KeyedSerialQueue } from './keyed_serial_queue.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = path.resolve(process.env.BOT_DIR || __dirname);
@@ -18,8 +21,21 @@ const AUDIO_DIR = path.join(BASE_DIR, 'data', 'audios');
 const MESSAGES_FILE = path.join(BASE_DIR, 'data', 'messages.json');
 const AUTH_DIR = path.join(BASE_DIR, 'data', 'wa_auth');
 const CALL_HEALTH_FILE = path.join(BASE_DIR, 'data', 'wa_call_health.json');
-const RESET_TIMEOUT = 3600 * 1000; // 1 hora en ms
+const INTERACTION_STATE_FILE = path.join(BASE_DIR, 'data', 'wa_interaction_state.json');
+const configuredDefaultLanguage = String(process.env.AUTOREPLY_DEFAULT_LANG || 'es').toLowerCase();
+const DEFAULT_LANGUAGE = ['es', 'en', 'fr'].includes(configuredDefaultLanguage)
+  ? configuredDefaultLanguage
+  : 'es';
 const callHealth = createWhatsAppCallHealth({ filePath: CALL_HEALTH_FILE, logger: console });
+const interactionState = new PersistentInteractionState({
+  filePath: INTERACTION_STATE_FILE,
+  defaultLanguage: DEFAULT_LANGUAGE,
+  logger: console,
+});
+// El reclamo global conserva el orden exacto de llegada antes de cualquier
+// resolución LID/PN. La entrega sigue aislada por contacto.
+const interactionClaimQueue = new KeyedSerialQueue();
+const deliveryQueue = new KeyedSerialQueue();
 const RECONNECT_DELAY_MS = 2_000;
 
 let activeSocket = null;
@@ -44,6 +60,9 @@ function loadMessages() {
   const data = JSON.parse(raw);
   const result = {};
   for (const [lang, langData] of Object.entries(data)) {
+    if (!Array.isArray(langData.steps) || langData.steps.length < 2) {
+      throw new Error(`[WA] El idioma ${lang} necesita Paso 1 y Paso 2`);
+    }
     result[lang] = {
       steps: langData.steps.map(s => ({ text: s.text, audio: s.audio, loop: s.loop || false })),
       call: langData.call || { text: '📞 Llamada recibida', audio: '' }
@@ -66,16 +85,16 @@ fs.watchFile(MESSAGES_FILE, () => {
 
 // ── Detección de idioma (misma lógica que bot.py) ──
 const LANG_PATTERNS = {
-  es: /\b(hola|gracias|por\s*favor|buenos\s*días|quiero|necesito|ayuda|habla|buenas|amigo|claro|vale|dale|listo|entiendo|puedes|hacer|dónde|cuándo|cómo|cuál|quién|eso|esto|algo|nada|todo|más|menos|está|estoy|estamos|están|tengo|tiene|tenemos|soy|eres|somos|son)\b/gi,
-  en: /\b(hello|hi|thanks|thank\s*you|please|help|want|need|can\s*i|yes|sure|fine|good|great|hey|would|could|should|where|when|how|what|who|that|this|there|here|is|are|am|have|has|do|does|did|will|may|might)\b/gi,
-  fr: /\b(bonjour|merci|s'il\s*vous\s*plaît|aide|besoin|vouloir|oui|d'accord|bien|tres|peux|peut|où|quand|comment|quoi|qui|que|est|suis|sommes|êtes|sont|ai|as|a|avons|avez|ont|je|tu|il|elle|nous|vous|ils|elles|ce|cet|cette|ces|mon|ton|son|ma|ta|sa)\b/gi,
+  es: /\b(hola|gracias|por\s*favor|buenos\s*días|quiero|necesito|ayuda|habla|precio|precios|tarifa|tarifas|reserva|reservas|foto|fotos|vídeo|vídeos|video|videos|buenas|amigo|claro|vale|dale|listo|entiendo|puedes|hacer|dónde|cuándo|cómo|cuál|quién|eso|esto|algo|nada|todo|más|menos|está|estoy|estamos|están|tengo|tiene|tenemos|soy|eres|somos|son)\b/gi,
+  en: /\b(hello|hi|thanks|thank\s*you|please|help|want|need|can\s*i|price|prices|rate|rates|book|booking|photo|photos|video|videos|yes|sure|fine|good|great|hey|would|could|should|where|when|how|what|who|that|this|there|here|is|are|am|have|has|do|does|did|will|may|might)\b/gi,
+  fr: /\b(bonjour|merci|s'il\s*vous\s*plaît|aide|besoin|vouloir|prix|tarif|tarifs|réservation|réserver|photo|photos|vidéo|vidéos|oui|d'accord|bien|tres|peux|peut|où|quand|comment|quoi|qui|que|est|suis|sommes|êtes|sont|ai|as|a|avons|avez|ont|je|tu|il|elle|nous|vous|ils|elles|ce|cet|cette|ces|mon|ton|son|ma|ta|sa)\b/gi,
 };
 const LANG_MARKERS = {
   es: /\b(español|castellano|hablo español|hablo espanol)\b/i,
   en: /\b(english|speak english)\b/i,
   fr: /\b(français|francais|parle français|parle francais)\b/i,
 };
-const AMBIGUOUS = new Set(['ok', 'no', 'si', 'hey', 'hi', 'hello']);
+const AMBIGUOUS = new Set(['ok', 'no', 'si', 'hey']);
 
 function detectLang(text) {
   const scores = { es: 0, en: 0, fr: 0 };
@@ -98,17 +117,11 @@ function detectLang(text) {
     }
   }
 
-  if (Math.max(...Object.values(scores)) < 1) return 'en';
+  if (Math.max(...Object.values(scores)) < 1) return null;
   return Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0];
 }
 
 // ── Estado por usuario ──
-const userState = new Map();
-
-function isExpired(state) {
-  return Date.now() - state.lastSeen > RESET_TIMEOUT;
-}
-
 // ── Obtener mensaje para un paso ──
 function getMessage(lang, step) {
   const data = MESSAGES[lang] || MESSAGES['en'];
@@ -119,6 +132,11 @@ function getMessage(lang, step) {
 function getCallMessage(lang) {
   const data = MESSAGES[lang] || MESSAGES['en'];
   return data.call || { text: '📞 Llamada recibida', audio: '' };
+}
+
+function getResponseMessage(lang, responseKey) {
+  if (responseKey === 'call') return getCallMessage(lang);
+  return getMessage(lang, responseKey === 'step1' ? 0 : 1);
 }
 
 // ── Leer archivo de audio como buffer ──
@@ -162,15 +180,17 @@ async function startBot() {
     rejectCall: (callId, callFrom) => sock.rejectCall(callId, callFrom),
     sendMessage: (jid, content) => sock.sendMessage(jid, content),
     getCallMessage,
-    readAudio,
-    getLanguage: (call, replyJid) => {
-      const candidates = [replyJid, call.chatId, call.callerPn, call.from].filter(Boolean);
-      for (const jid of candidates) {
-        const state = userState.get(jid);
-        if (state && !isExpired(state)) return state.lang;
-      }
-      return 'en';
+    getResponseMessage,
+    routeInteraction: details => interactionState.register(details),
+    resolveContactId: async (jid) => {
+      if (!jid.endsWith('@lid') && !jid.endsWith('@hosted.lid')) return jid;
+      return sock.signalRepository?.lidMapping?.getPNForLID
+        ? (await sock.signalRepository.lidMapping.getPNForLID(jid)) || jid
+        : jid;
     },
+    serializeClaim: operation => interactionClaimQueue.run('all-inbound', operation),
+    serializeInteraction: (contactId, operation) => deliveryQueue.run(contactId, operation),
+    readAudio,
     logger: console,
     onCallMetric: callHealth.record,
   });
@@ -221,85 +241,24 @@ async function startBot() {
     }
   });
 
-  // ── Manejar mensajes entrantes ──
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    console.log(`[WA] messages.upsert type=${type} count=${messages.length}`);
-    // Solo procesar notify (mensajes reales), ignorar sync/echo
-    if (type !== 'notify') return;
-
-    for (const msg of messages) {
-      // Ignorar mensajes propios, status, grupos
-      if (msg.key.fromMe) continue;
-      const remoteJid = msg.key.remoteJid || '';
-      const altJid = msg.key.remoteJidAlt || '';
-      if (remoteJid.endsWith('@g.us') || altJid.endsWith('@g.us')) continue; // ignorar grupos
-      
-      // Aceptar tanto @s.whatsapp.net como @lid (nuevo formato WhatsApp)
-      const isDirectMessage = remoteJid.endsWith('@s.whatsapp.net') 
-                           || remoteJid.endsWith('@lid')
-                           || altJid.endsWith('@s.whatsapp.net');
-      if (!isDirectMessage) {
-        console.log('[WA] skipped non-direct message');
-        continue;
-      }
-
-      // Usar el JID alternativo si el principal es @lid
-      const jid = remoteJid.endsWith('@s.whatsapp.net') ? remoteJid : altJid;
-      if (!jid) continue;
-      
-      const text = (msg.message?.conversation || msg.message?.extendedTextMessage?.text || '').trim();
-
-      if (!text) {
-        // Podría ser un audio/imagen — ignoramos por ahora (solo texto)
-        continue;
-      }
-
-      const now = Date.now();
-      let state = userState.get(jid);
-
-      // ── Nuevo ciclo o expired ──
-      let stepToUse;
-      if (!state || isExpired(state)) {
-        if (state) {
-          console.log('[WA] conversation state expired; starting a new cycle');
-        }
-        const lang = detectLang(text);
-        state = { lang, step: 0, lastSeen: now };
-        userState.set(jid, state);
-        stepToUse = 0;
-      } else {
-        const maxStep = MESSAGES[state.lang]?.steps?.length - 1 || 2;
-        stepToUse = Math.min(state.step + 1, maxStep);
-        state.lastSeen = now;
-      }
-
-      const lang = state.lang;
-      const msgData = getMessage(lang, stepToUse);
-
-      // Solo avanzar step si NO es loop
-      if (!msgData.loop) {
-        state.step = stepToUse;
-      }
-
-      // ── Enviar texto ──
-      await sock.sendMessage(jid, { text: msgData.text });
-      console.log(`[WA] reply sent lang=${lang} step=${stepToUse}`);
-
-      // ── Enviar audio (si existe) ──
-      const audioBuffer = readAudio(msgData.audio);
-      if (audioBuffer) {
-        try {
-          await sock.sendMessage(jid, {
-            audio: audioBuffer,
-            mimetype: 'audio/mpeg',
-            ptt: false, // true = nota de voz
-          });
-        } catch (err) {
-          console.error('[WA] audio delivery failed');
-        }
-      }
-    }
+  // Un único manejador cuenta texto y cualquier multimedia en el mismo estado
+  // que las llamadas. Los eventos de sincronización y control se descartan.
+  const handleMessageBatch = createWhatsAppMessageHandler({
+    sendMessage: (jid, content) => sock.sendMessage(jid, content),
+    routeInteraction: details => interactionState.register(details),
+    getResponseMessage,
+    readAudio,
+    detectLanguage: detectLang,
+    resolvePnForLid: async (lid) => (
+      sock.signalRepository?.lidMapping?.getPNForLID
+        ? sock.signalRepository.lidMapping.getPNForLID(lid)
+        : null
+    ),
+    serializeClaim: operation => interactionClaimQueue.run('all-inbound', operation),
+    serializeInteraction: (contactId, operation) => deliveryQueue.run(contactId, operation),
+    logger: console,
   });
+  sock.ev.on('messages.upsert', handleMessageBatch);
 
 }
 

@@ -1,0 +1,113 @@
+"""Validation and non-destructive migration for the fixed two-step flow."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+import json
+import os
+from pathlib import Path
+import sys
+
+
+def normalize_message_schema(messages: object, defaults: object) -> tuple[dict, bool]:
+    if not isinstance(messages, dict) or not isinstance(defaults, dict):
+        raise ValueError("messages and defaults must be objects")
+
+    normalized = deepcopy(messages)
+    changed = False
+    for language, default_language_data in defaults.items():
+        if not isinstance(default_language_data, dict):
+            continue
+        language_data = normalized.get(language)
+        if not isinstance(language_data, dict):
+            normalized[language] = deepcopy(default_language_data)
+            language_data = normalized[language]
+            changed = True
+
+        steps = language_data.get("steps")
+        if not isinstance(steps, list):
+            steps = []
+            language_data["steps"] = steps
+            changed = True
+        default_steps = default_language_data.get("steps", [])
+        if not isinstance(default_steps, list) or len(default_steps) < 2:
+            raise ValueError(f"No hay dos pasos predeterminados para {language}")
+        while len(steps) < 2:
+            steps.append(deepcopy(default_steps[len(steps)]))
+            changed = True
+
+        for index in range(2):
+            default_step = default_steps[index]
+            if not isinstance(default_step, dict):
+                raise ValueError(f"El paso {index + 1} predeterminado de {language} no es válido")
+            if not isinstance(steps[index], dict):
+                steps[index] = deepcopy(default_step)
+                changed = True
+            for field in ("text", "audio"):
+                current_value = steps[index].get(field)
+                if not isinstance(current_value, str) or not current_value.strip():
+                    default_value = default_step.get(field)
+                    if not isinstance(default_value, str) or not default_value.strip():
+                        raise ValueError(
+                            f"Falta {field} en el paso {index + 1} predeterminado de {language}"
+                        )
+                    steps[index][field] = default_value
+                    changed = True
+            desired_loop = index == 1
+            if steps[index].get("loop") is not desired_loop:
+                steps[index]["loop"] = desired_loop
+                changed = True
+            if steps[index].get("step") != index + 1:
+                steps[index]["step"] = index + 1
+                changed = True
+
+        default_call = default_language_data.get("call", {})
+        if not isinstance(default_call, dict):
+            raise ValueError(f"La llamada predeterminada de {language} no es válida")
+        if not isinstance(language_data.get("call"), dict):
+            language_data["call"] = deepcopy(default_call)
+            changed = True
+        call = language_data["call"]
+        for field in ("text", "audio"):
+            current_value = call.get(field)
+            if not isinstance(current_value, str) or not current_value.strip():
+                default_value = default_call.get(field)
+                if not isinstance(default_value, str) or not default_value.strip():
+                    raise ValueError(f"Falta {field} en la llamada predeterminada de {language}")
+                call[field] = default_value
+                changed = True
+
+    return normalized, changed
+
+
+def load_message_file(
+    messages_path: str | Path,
+    defaults_path: str | Path,
+    *,
+    persist: bool = False,
+) -> dict:
+    messages_path = Path(messages_path)
+    defaults_path = Path(defaults_path)
+    messages = json.loads(messages_path.read_text(encoding="utf-8"))
+    defaults = json.loads(defaults_path.read_text(encoding="utf-8"))
+    normalized, changed = normalize_message_schema(messages, defaults)
+    if persist and changed:
+        temporary_path = messages_path.with_suffix(messages_path.suffix + ".tmp")
+        temporary_path.write_text(
+            json.dumps(normalized, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, messages_path)
+    return normalized
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 3:
+        print("Uso: message_schema.py <messages.json> <defaults.json>", file=sys.stderr)
+        return 2
+    load_message_file(argv[1], argv[2], persist=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
