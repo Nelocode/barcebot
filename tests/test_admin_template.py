@@ -63,6 +63,19 @@ class AdminTemplateTestCase(unittest.TestCase):
             len(re.findall(r'class="[^"]*\bwa-switch-cancel\b[^"]*"', template)),
         )
 
+    def test_telegram_audio_performer_is_editable_without_html_injection(self):
+        template = app_module.TEMPLATE
+        self.assertIn('id="tg-audio-performer"', template)
+        self.assertIn('maxlength="80"', template)
+        self.assertIn('fetch("/api/telegram_audio_branding"', template)
+        self.assertIn("headers: channelHeaders()", template)
+        self.assertIn("let tgAudioBrandingDirty = false", template)
+        self.assertIn("!tgAudioBrandingDirty && document.activeElement !== input", template)
+        self.assertIn("input.value = performer", template)
+        self.assertIn("preview.textContent = performer", template)
+        self.assertIn("brandingSave.disabled = !data.can_manage", template)
+        self.assertNotIn("preview.innerHTML = performer", template)
+
 
 if __name__ == "__main__":
     unittest.main()

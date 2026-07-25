@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterable, Mapping
 from pathlib import Path
+import unicodedata
 
 from telethon.tl import types
 
@@ -20,6 +22,7 @@ else:
 
 AUDIO_TITLE = "Las Fiesteras"
 AUDIO_PERFORMER = "Caché Madrid"
+AUDIO_BRANDING_MAX_LENGTH = 80
 
 
 def _environment_text(
@@ -33,17 +36,83 @@ def _environment_text(
     return value.strip() or default
 
 
+def _branding_text(value: object) -> str | None:
+    """Return a safe Telegram label or ``None`` for an unusable value."""
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > AUDIO_BRANDING_MAX_LENGTH:
+        return None
+    if any(unicodedata.category(character).startswith("C") for character in normalized):
+        return None
+    return normalized
+
+
+def _read_branding_file(path: str | Path | None) -> dict[str, str]:
+    if path is None:
+        return {}
+    try:
+        parsed = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        field: normalized
+        for field in ("title", "performer")
+        if (normalized := _branding_text(parsed.get(field))) is not None
+    }
+
+
 def resolve_audio_branding(
     *,
     environ: Mapping[str, str] | None = None,
+    defaults_path: str | Path | None = None,
+    settings_path: str | Path | None = None,
 ) -> tuple[str, str]:
-    """Resolve per-deployment labels while preserving Madrid defaults."""
+    """Resolve packaged, environment and panel labels in precedence order."""
 
     source = os.environ if environ is None else environ
-    return (
-        _environment_text(source, "TG_AUDIO_TITLE", AUDIO_TITLE),
-        _environment_text(source, "TG_AUDIO_PERFORMER", AUDIO_PERFORMER),
+    resolved = {"title": AUDIO_TITLE, "performer": AUDIO_PERFORMER}
+    resolved.update(_read_branding_file(defaults_path))
+    resolved["title"] = _environment_text(
+        source,
+        "TG_AUDIO_TITLE",
+        resolved["title"],
     )
+    resolved["performer"] = _environment_text(
+        source,
+        "TG_AUDIO_PERFORMER",
+        resolved["performer"],
+    )
+    resolved.update(_read_branding_file(settings_path))
+    return resolved["title"], resolved["performer"]
+
+
+def save_audio_branding_settings(
+    settings_path: str | Path,
+    *,
+    performer: object,
+) -> dict[str, str]:
+    """Validate and atomically persist the performer edited in the panel."""
+
+    normalized = _branding_text(performer)
+    if normalized is None:
+        raise ValueError(
+            f"El nombre debe tener entre 1 y {AUDIO_BRANDING_MAX_LENGTH} caracteres visibles."
+        )
+
+    destination = Path(settings_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"performer": normalized}
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, destination)
+    return payload
 
 
 def resolve_audio_cover_path(
@@ -69,10 +138,17 @@ def brand_audio_attributes(
     attributes: Iterable[object],
     *,
     filename: str,
+    environ: Mapping[str, str] | None = None,
+    defaults_path: str | Path | None = None,
+    settings_path: str | Path | None = None,
 ) -> list[object]:
     """Preserve file metadata and enforce Telegram's non-voice audio card."""
 
-    title, performer = resolve_audio_branding()
+    title, performer = resolve_audio_branding(
+        environ=environ,
+        defaults_path=defaults_path,
+        settings_path=settings_path,
+    )
     result: list[object] = []
     duration = 0
     has_filename = False

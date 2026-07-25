@@ -19,12 +19,18 @@ from pathlib import Path
 from flask import Flask, render_template_string, request, jsonify, send_from_directory, session
 from telegram_auth import TelegramAuthManager
 from message_schema import load_message_file
+from telegram_audio_branding import (
+    resolve_audio_branding,
+    save_audio_branding_settings,
+)
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 AUDIO_DIR = DATA_DIR / "audios"
 MESSAGES_FILE = DATA_DIR / "messages.json"
 DEFAULT_MESSAGES_FILE = BASE_DIR / "messages.json"
+TG_AUDIO_BRANDING_DEFAULTS_FILE = BASE_DIR / "telegram_audio_branding.defaults.json"
+TG_AUDIO_BRANDING_SETTINGS_FILE = DATA_DIR / "telegram_audio_branding.json"
 WA_CALL_HEALTH_FILE = DATA_DIR / "wa_call_health.json"
 TG_SESSION_BASE = DATA_DIR / "tg_session"
 TG_SWITCH_SESSION_BASE = DATA_DIR / "tg_switch_session"
@@ -220,6 +226,24 @@ label { color: #c8c8e0 !important; font-weight: 500; }
         </div>
       </div>
 
+      <!-- ── Marca de los audios TG ── -->
+      <hr class="my-3">
+      <h6 class="mb-2">🎵 Presentación de los audios en Telegram</h6>
+      <p class="small text-muted mb-2">
+        Edita el nombre de la agencia que aparece en la tarjeta del audio. El cambio
+        se aplica al siguiente envío y se conserva después de redesplegar.
+      </p>
+      <div class="d-flex align-items-center gap-2">
+        <input id="tg-audio-performer" type="text" maxlength="80"
+               class="form-control form-control-sm"
+               placeholder="Caché Barcelona" aria-label="Nombre mostrado en los audios de Telegram"
+               oninput="tgAudioBrandingDirty = true">
+        <button id="tg-audio-branding-save" class="btn btn-sm btn-success"
+                onclick="saveTelegramAudioBranding()" disabled>💾 Guardar nombre</button>
+      </div>
+      <div id="tg-audio-branding-preview" class="small text-muted mt-2"></div>
+      <div id="tg-audio-branding-status" class="small text-muted mt-1"></div>
+
       <!-- ── BotFather (Bot API tradicional) ── -->
       <hr class="my-3">
       <h6 class="mb-2">🤖 BotFather (modo prueba/revisión)</h6>
@@ -332,6 +356,7 @@ let waSwitchPolling = false;
 let waCommitInFlight = false;
 let waSwitchGeneration = 0;
 let waSwitchPollAbortController = null;
+let tgAudioBrandingDirty = false;
 
 function toast(msg, type="success") {
   const c = document.getElementById("toast-container");
@@ -347,11 +372,57 @@ async function loadData() {
     const r = await fetch("/api/data");
     const data = await r.json();
     renderSteps(data);
+    renderTelegramAudioBranding(data.telegram_audio_branding || {});
     updateBotStatus(data.bot_running);
     updateBfStatus(data.bf_running);
     updateWaStatus(data.wa_running);
   } catch(e) {
     toast("Error cargando datos: " + e.message, "error");
+  }
+}
+
+function renderTelegramAudioBranding(branding) {
+  const input = document.getElementById("tg-audio-performer");
+  const preview = document.getElementById("tg-audio-branding-preview");
+  if (!input || !preview) return;
+  const performer = String(branding.performer || "");
+  const title = String(branding.title || "Las Fiesteras");
+  if (!tgAudioBrandingDirty && document.activeElement !== input) input.value = performer;
+  preview.textContent = performer
+    ? `Vista previa: ${performer} — ${title}`
+    : "Escribe el nombre que debe aparecer en Telegram.";
+}
+
+async function saveTelegramAudioBranding() {
+  const input = document.getElementById("tg-audio-performer");
+  const button = document.getElementById("tg-audio-branding-save");
+  const status = document.getElementById("tg-audio-branding-status");
+  const performer = input.value.trim();
+  if (!performer) {
+    toast("❌ Escribe el nombre de la agencia", "error");
+    input.focus();
+    return;
+  }
+
+  button.disabled = true;
+  status.textContent = "Guardando…";
+  try {
+    const r = await fetch("/api/telegram_audio_branding", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: JSON.stringify({performer})
+    });
+    const data = await r.json();
+    if (!r.ok || !data.ok) throw new Error(data.error || "No fue posible guardar el nombre");
+    tgAudioBrandingDirty = false;
+    renderTelegramAudioBranding(data);
+    status.textContent = "✅ Se aplicará al próximo audio de Telegram.";
+    toast("✅ Nombre de los audios actualizado", "success");
+  } catch(e) {
+    status.textContent = "❌ " + e.message;
+    toast("❌ " + e.message, "error");
+  } finally {
+    button.disabled = !(channelState && channelState.can_manage);
   }
 }
 
@@ -729,7 +800,15 @@ function renderChannelState(data) {
   const tgLinked = document.getElementById("tg-linked-actions");
   const tgSummary = document.getElementById("tg-account-summary");
   const tgSwitchOpen = document.getElementById("tg-switch-open-btn");
+  const brandingSave = document.getElementById("tg-audio-branding-save");
+  const brandingStatus = document.getElementById("tg-audio-branding-status");
   tgSwitchOpen.disabled = !data.can_manage || tg.state === "recovery_required";
+  brandingSave.disabled = !data.can_manage;
+  if (!data.can_manage) {
+    brandingStatus.textContent = "🔐 Confirma la cuenta de Telegram para editar este nombre.";
+  } else if (brandingStatus.textContent.startsWith("🔐")) {
+    brandingStatus.textContent = "";
+  }
   if (tg.linked) {
     tgInitial.style.display = data.can_manage ? "none" : "block";
     tgLinked.style.display = data.can_manage ? "block" : "none";
@@ -1344,6 +1423,14 @@ def save_messages_json(data):
     with open(MESSAGES_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+
+def load_telegram_audio_branding() -> dict[str, str]:
+    title, performer = resolve_audio_branding(
+        defaults_path=TG_AUDIO_BRANDING_DEFAULTS_FILE,
+        settings_path=TG_AUDIO_BRANDING_SETTINGS_FILE,
+    )
+    return {"title": title, "performer": performer}
+
 def _read_env_var(key: str) -> str | None:
     """Lee una variable desde data/.env.local."""
     env_file = DATA_DIR / ".env.local"
@@ -1873,7 +1960,42 @@ def api_data():
         "bf_running": bf_is_running(),
         "wa_running": wa_running,
         "wa_qr": qr_available,
-        "audios": audios
+        "audios": audios,
+        "telegram_audio_branding": load_telegram_audio_branding(),
+    })
+
+
+@app.route("/api/telegram_audio_branding", methods=["GET", "POST"])
+def api_telegram_audio_branding():
+    """Lee o guarda el nombre mostrado en las tarjetas de audio de Telegram."""
+
+    if request.method == "GET":
+        response = jsonify({"ok": True, **load_telegram_audio_branding()})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "No se recibió una configuración válida."}), 400
+
+    try:
+        save_audio_branding_settings(
+            TG_AUDIO_BRANDING_SETTINGS_FILE,
+            performer=data.get("performer"),
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except OSError:
+        return jsonify({"ok": False, "error": "No fue posible guardar la marca del audio."}), 500
+
+    return jsonify({
+        "ok": True,
+        **load_telegram_audio_branding(),
+        "message": "Marca guardada; se aplicará al próximo audio de Telegram.",
     })
 
 @app.route("/api/wa_qr")

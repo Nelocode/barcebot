@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from telegram_audio_branding import (
     build_branded_audio_media,
     resolve_audio_branding,
     resolve_audio_cover_path,
+    save_audio_branding_settings,
 )
 
 
@@ -53,6 +55,115 @@ class TelegramAudioBrandingTests(unittest.TestCase):
         )
         self.assertEqual("Las Fiesteras", audio.title)
         self.assertEqual("Caché Barcelona", audio.performer)
+
+    def test_packaged_barcelona_default_and_panel_override_have_clear_precedence(self):
+        packaged = Path(__file__).parents[1] / "telegram_audio_branding.defaults.json"
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Path(directory) / "telegram_audio_branding.json"
+            with patch.dict(
+                os.environ,
+                {
+                    "TG_AUDIO_TITLE": "Título de Easypanel",
+                    "TG_AUDIO_PERFORMER": "Agencia de Easypanel",
+                },
+            ):
+                title, performer = resolve_audio_branding(defaults_path=packaged)
+                self.assertEqual("Título de Easypanel", title)
+                self.assertEqual("Agencia de Easypanel", performer)
+
+                save_audio_branding_settings(
+                    settings,
+                    performer="  Agencia elegida en el panel  ",
+                )
+                title, performer = resolve_audio_branding(
+                    defaults_path=packaged,
+                    settings_path=settings,
+                )
+
+        self.assertEqual("Título de Easypanel", title)
+        self.assertEqual("Agencia elegida en el panel", performer)
+
+    def test_packaged_default_is_barcelona_without_changing_builtin_madrid_fallback(self):
+        packaged = Path(__file__).parents[1] / "telegram_audio_branding.defaults.json"
+
+        self.assertEqual(
+            ("Las Fiesteras", "Caché Barcelona"),
+            resolve_audio_branding(environ={}, defaults_path=packaged),
+        )
+        self.assertEqual(
+            ("Las Fiesteras", "Caché Madrid"),
+            resolve_audio_branding(environ={}),
+        )
+
+    def test_invalid_panel_file_falls_back_without_blocking_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Path(directory) / "telegram_audio_branding.json"
+            settings.write_text("{not-json", encoding="utf-8")
+
+            branded = brand_audio_attributes(
+                [],
+                filename="es_msg1.mp3",
+                environ={"TG_AUDIO_PERFORMER": "Respaldo seguro"},
+                settings_path=settings,
+            )
+
+        audio = next(
+            item for item in branded
+            if isinstance(item, types.DocumentAttributeAudio)
+        )
+        self.assertEqual("Respaldo seguro", audio.performer)
+
+    def test_panel_setting_rejects_empty_long_and_control_characters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Path(directory) / "telegram_audio_branding.json"
+            for invalid in ("", "   ", "x" * 81, "Barcelona\nTG_API_HASH=injected"):
+                with self.subTest(invalid=repr(invalid)):
+                    with self.assertRaises(ValueError):
+                        save_audio_branding_settings(settings, performer=invalid)
+                    self.assertFalse(settings.exists())
+
+    def test_panel_setting_is_written_as_utf8_json_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Path(directory) / "telegram_audio_branding.json"
+
+            saved = save_audio_branding_settings(
+                settings,
+                performer="Caché Barcelona",
+            )
+
+            self.assertEqual({"performer": "Caché Barcelona"}, saved)
+            self.assertEqual(
+                {"performer": "Caché Barcelona"},
+                json.loads(settings.read_text(encoding="utf-8")),
+            )
+            self.assertFalse(settings.with_suffix(".json.tmp").exists())
+
+    def test_brand_attributes_reloads_panel_setting_for_each_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Path(directory) / "telegram_audio_branding.json"
+            save_audio_branding_settings(settings, performer="Marca inicial")
+            first = brand_audio_attributes(
+                [],
+                filename="es_msg1.mp3",
+                environ={},
+                settings_path=settings,
+            )
+            save_audio_branding_settings(settings, performer="Marca actualizada")
+            second = brand_audio_attributes(
+                [],
+                filename="es_msg2.mp3",
+                environ={},
+                settings_path=settings,
+            )
+
+        first_audio = next(
+            item for item in first if isinstance(item, types.DocumentAttributeAudio)
+        )
+        second_audio = next(
+            item for item in second if isinstance(item, types.DocumentAttributeAudio)
+        )
+        self.assertEqual("Marca inicial", first_audio.performer)
+        self.assertEqual("Marca actualizada", second_audio.performer)
 
     def test_blank_branding_variables_fall_back_to_madrid(self):
         with patch.dict(
