@@ -3,9 +3,10 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 import unittest
 
-from telethon.tl import types
+from telethon.tl import functions, types
 
 from telegram_events import (
+    missed_call_search_request,
     missed_call_interaction,
     new_message_interaction,
     phone_call_subtype,
@@ -143,6 +144,17 @@ class TelegramEventExtractionTests(unittest.TestCase):
         empty = types.UpdatePhoneCall(types.PhoneCallEmpty(id=901))
         self.assertEqual("discarded", phone_call_subtype(discarded))
         self.assertEqual("empty", phone_call_subtype(empty))
+
+    def test_missed_call_fallback_uses_supported_private_history_search(self):
+        not_before = datetime(2026, 7, 24, tzinfo=timezone.utc)
+        request = missed_call_search_request(not_before)
+
+        self.assertIsInstance(request, functions.messages.SearchRequest)
+        self.assertIsInstance(request.peer, types.InputPeerEmpty)
+        self.assertIsInstance(request.filter, types.InputMessagesFilterPhoneCalls)
+        self.assertTrue(request.filter.missed)
+        self.assertEqual(not_before, request.min_date)
+        self.assertEqual(30, request.limit)
 
     def test_reply_peer_uses_entities_carried_by_raw_update(self):
         user = types.User(id=123, access_hash=456, first_name="Caller")

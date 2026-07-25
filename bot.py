@@ -28,6 +28,7 @@ from interaction_state import PersistentInteractionState
 from message_schema import load_message_file
 from telegram_events import (
     PHONE_CALL_SUBTYPES,
+    missed_call_search_request,
     missed_call_interaction,
     new_message_interaction,
     phone_call_subtype,
@@ -513,17 +514,16 @@ async def poll_recent_missed_calls() -> None:
     not_before = datetime.now(timezone.utc) - timedelta(seconds=45)
     while True:
         try:
-            messages = [
-                message
-                async for message in client.iter_messages(
-                    None,
-                    limit=30,
-                    filter=types.InputMessagesFilterPhoneCalls(missed=True),
-                    wait_time=0,
-                )
-            ]
+            # ``SearchGlobalRequest`` rejects InputMessagesFilterPhoneCalls.
+            # The same filter is supported by messages.search when its peer is
+            # InputPeerEmpty, which searches the user's private call history.
+            result = await client(missed_call_search_request(not_before))
+            entities = {
+                utils.get_peer_id(entity): entity
+                for entity in (*result.users, *result.chats)
+            }
             update_interaction_health(missed_call_poll="healthy")
-            for message in reversed(messages):
+            for message in reversed(result.messages):
                 message_date = getattr(message, "date", None)
                 if message_date is None:
                     continue
@@ -531,8 +531,10 @@ async def poll_recent_missed_calls() -> None:
                     message_date = message_date.replace(tzinfo=timezone.utc)
                 if message_date < not_before:
                     continue
+                if hasattr(message, "_finish_init"):
+                    message._finish_init(client, entities, None)
                 await handle_missed_call_service(
-                    SimpleNamespace(message=message, _entities={})
+                    SimpleNamespace(message=message, _entities=entities)
                 )
         except asyncio.CancelledError:
             raise

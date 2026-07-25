@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from telethon import errors, utils
-from telethon.tl import types
+from telethon.tl import functions, types
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,24 @@ def phone_call_subtype(update) -> str:
     if isinstance(phone_call, types.PhoneCallEmpty):
         return "empty"
     return "other"
+
+
+def missed_call_search_request(not_before):
+    """Build the compatible private-history search for recent missed calls."""
+
+    return functions.messages.SearchRequest(
+        peer=types.InputPeerEmpty(),
+        q="",
+        filter=types.InputMessagesFilterPhoneCalls(missed=True),
+        min_date=not_before,
+        max_date=None,
+        offset_id=0,
+        add_offset=0,
+        limit=30,
+        max_id=0,
+        min_id=0,
+        hash=0,
+    )
 
 
 def new_message_interaction(
