@@ -151,8 +151,11 @@ export class PersistentInteractionState {
     const language = state.language || this.defaultLanguage;
 
     let responseKey;
-    if (state.phase === 0) {
-      responseKey = kind === 'call' ? 'call' : 'step1';
+    if (kind === 'call') {
+      responseKey = 'call';
+      state.phase = state.phase === 0 ? 1 : 2;
+    } else if (state.phase === 0) {
+      responseKey = 'step1';
       state.phase = 1;
     } else {
       responseKey = 'step2';

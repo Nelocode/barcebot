@@ -30,7 +30,7 @@ class PersistentInteractionStateTests(unittest.TestCase):
     def make_store(self, directory: str, **kwargs) -> PersistentInteractionState:
         return PersistentInteractionState(Path(directory) / "state.json", **kwargs)
 
-    def test_first_call_is_call_and_every_later_event_is_step2(self):
+    def test_every_distinct_call_is_call_and_later_content_is_step2(self):
         with tempfile.TemporaryDirectory() as directory:
             store = self.make_store(directory)
 
@@ -39,9 +39,26 @@ class PersistentInteractionStateTests(unittest.TestCase):
             third = store.register(contact_id=1, event_id="message:3", kind="content")
 
             self.assertEqual("call", first.response_key)
-            self.assertEqual("step2", second.response_key)
+            self.assertEqual("call", second.response_key)
             self.assertEqual("step2", third.response_key)
             self.assertEqual([1, 2, 2], [first.phase, second.phase, third.phase])
+
+    def test_call_after_content_is_call_and_following_content_is_step2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+
+            first = store.register(contact_id=1, event_id="message:1", kind="content")
+            call = store.register(contact_id=1, event_id="call:2", kind="call")
+            following = store.register(
+                contact_id=1,
+                event_id="message:3",
+                kind="content",
+            )
+
+            self.assertEqual("step1", first.response_key)
+            self.assertEqual("call", call.response_key)
+            self.assertEqual("step2", following.response_key)
+            self.assertEqual([1, 2, 2], [first.phase, call.phase, following.phase])
 
     def test_first_content_is_step1_for_text_voice_image_or_file(self):
         with tempfile.TemporaryDirectory() as directory:

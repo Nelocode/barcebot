@@ -318,7 +318,7 @@ test('cada rama ignorada emite una razon de cardinalidad cerrada', async () => {
   assert.doesNotMatch(JSON.stringify(outcomes), /573001234567|@s\.whatsapp\.net|call-/);
 });
 
-test('la primera llamada usa CALL y la segunda llamada usa Paso 2', async () => {
+test('cada intento de llamada usa CALL aunque existan llamadas anteriores', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-state-'));
   const state = new PersistentInteractionState({
     filePath: path.join(directory, 'state.json'),
@@ -338,15 +338,15 @@ test('la primera llamada usa CALL y la segunda llamada usa Paso 2', async () => 
   const second = await handler([offer({ id: 'call-2' })]);
 
   assert.equal(first[0].response, 'call');
-  assert.equal(second[0].response, 'step2');
+  assert.equal(second[0].response, 'call');
   assert.deepEqual(
     effects.filter(([kind, , content]) => kind === 'send' && content.text)
       .map(([, , content]) => content.text),
-    ['call', 'step2'],
+    ['call', 'call'],
   );
 });
 
-test('una llamada posterior a un mensaje también envía Paso 2', async () => {
+test('una llamada posterior a un mensaje también envía CALL', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-call-state-'));
   const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
   state.register({
@@ -366,8 +366,8 @@ test('una llamada posterior a un mensaje también envía Paso 2', async () => {
 
   const result = await handler([offer({ id: 'call-after-message' })]);
 
-  assert.equal(result[0].response, 'step2');
-  assert.equal(effects[0][2].text, 'step2');
+  assert.equal(result[0].response, 'call');
+  assert.equal(effects[0][2].text, 'call');
 });
 
 test('la deduplicación persistente evita repetir una llamada tras reiniciar', async () => {

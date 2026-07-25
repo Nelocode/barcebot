@@ -66,6 +66,47 @@ class TelegramInteractionDispatcherTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(duplicate.duplicate)
             self.assertEqual(1, len(deliveries))
 
+    async def test_every_distinct_call_uses_call_even_after_prior_interactions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = PersistentInteractionState(Path(directory) / "state.json")
+            deliveries = []
+
+            async def send_response(_peer, response_key, _language, _fingerprint):
+                deliveries.append(response_key)
+
+            dispatcher = TelegramInteractionDispatcher(state, send_response)
+            await dispatcher.dispatch(
+                chat_id=1,
+                event_id="message:1",
+                kind="content",
+            )
+            first_call = await dispatcher.dispatch(
+                chat_id=1,
+                event_id="call:700",
+                kind="call",
+            )
+            second_call = await dispatcher.dispatch(
+                chat_id=1,
+                event_id="call:701",
+                kind="call",
+            )
+            duplicate_fallback = await dispatcher.dispatch(
+                chat_id=1,
+                event_id="call:701",
+                kind="call",
+            )
+            following_content = await dispatcher.dispatch(
+                chat_id=1,
+                event_id="message:2",
+                kind="content",
+            )
+
+            self.assertEqual("call", first_call.response_key)
+            self.assertEqual("call", second_call.response_key)
+            self.assertTrue(duplicate_fallback.duplicate)
+            self.assertEqual("step2", following_content.response_key)
+            self.assertEqual(["step1", "call", "call", "step2"], deliveries)
+
     async def test_failed_delivery_does_not_consume_call_and_fallback_retries(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"

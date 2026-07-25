@@ -273,7 +273,10 @@ export function createWhatsAppCallHandler({
         audio: 'skipped',
         targetSource: replyTarget.source,
         targetKind: replyTarget.kind,
-        response: interactionDecision?.responseKey || (routeInteraction ? 'none' : 'call'),
+        // Every distinct call attempt receives the dedicated call response.
+        // routeInteraction still records the event and advances the contact
+        // phase; this boundary also protects against a custom router key.
+        response: 'call',
       };
 
       logger.info?.(`[WA CALL] Offer received${call.isVideo ? ' (video)' : ''}`);
@@ -282,7 +285,7 @@ export function createWhatsAppCallHandler({
       try {
         if (interactionDecision) {
           language = interactionDecision.language || 'es';
-          callMessage = getResponseMessage(language, interactionDecision.responseKey) || {};
+          callMessage = getResponseMessage(language, 'call') || {};
         } else {
           language = getLanguage(call, replyJid) || 'en';
           callMessage = getCallMessage(language) || {};

@@ -14,7 +14,7 @@ function createStore(directory, overrides = {}) {
   });
 }
 
-test('primera llamada usa call y toda interacción posterior usa step2', () => {
+test('cada llamada distinta usa call y el contenido posterior usa step2', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-state-'));
   const store = createStore(directory);
 
@@ -23,9 +23,24 @@ test('primera llamada usa call y toda interacción posterior usa step2', () => {
   const third = store.register({ contactId: 'a', eventId: 'message:3', kind: 'content' });
 
   assert.equal(first.responseKey, 'call');
-  assert.equal(second.responseKey, 'step2');
+  assert.equal(second.responseKey, 'call');
   assert.equal(third.responseKey, 'step2');
   assert.deepEqual([first.phase, second.phase, third.phase], [1, 2, 2]);
+});
+
+test('contenido, llamada y contenido producen step1, call y step2', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-state-'));
+  const store = createStore(directory);
+
+  const first = store.register({ contactId: 'a', eventId: 'message:1', kind: 'content' });
+  const call = store.register({ contactId: 'a', eventId: 'call:2', kind: 'call' });
+  const following = store.register({ contactId: 'a', eventId: 'message:3', kind: 'content' });
+
+  assert.deepEqual(
+    [first.responseKey, call.responseKey, following.responseKey],
+    ['step1', 'call', 'step2'],
+  );
+  assert.deepEqual([first.phase, call.phase, following.phase], [1, 2, 2]);
 });
 
 test('primer contenido usa step1 y los contactos quedan aislados', () => {
@@ -92,7 +107,7 @@ test('fusiona LID y PN y conserva el alias después de reiniciar', () => {
     contactAliases: ['123@lid', '573001234567@s.whatsapp.net'],
     eventId: 'call:2',
     kind: 'call',
-  }).responseKey, 'step2');
+  }).responseKey, 'call');
 
   const reloaded = new PersistentInteractionState({ filePath });
   assert.equal(reloaded.register({

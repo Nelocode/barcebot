@@ -1,8 +1,9 @@
 """Persistent, privacy-conscious interaction routing for Telegram.
 
-The state machine is deliberately saturated: after the first interaction every
-interaction receives step 2 forever. Calls only receive the special call
-response when they are the first interaction.
+The state machine is deliberately saturated for content: after the first
+interaction every text or media interaction receives step 2 forever.  Every
+distinct call attempt receives the special call response, regardless of the
+current phase, while still advancing the contact's interaction phase.
 """
 
 from __future__ import annotations
@@ -163,11 +164,14 @@ class PersistentInteractionState:
         effective_language = language or self.default_language
 
         previous_phase = state["phase"]
-        if previous_phase == 0:
-            response_key = "call" if kind == "call" else "step1"
+        if kind == "call":
+            response_key = "call"
+            next_phase = 1 if previous_phase == 0 else 2
+        elif previous_phase == 0:
+            response_key = "step1"
             next_phase = 1
         else:
-            # Every later interaction, including a call, uses step 2.
+            # Every later content interaction uses step 2.
             response_key = "step2"
             next_phase = 2
 
@@ -224,7 +228,10 @@ class PersistentInteractionState:
             )
 
         effective_language = language or detected_language or self.default_language
-        response_key = ("call" if kind == "call" else "step1") if phase == 0 else "step2"
+        if kind == "call":
+            response_key = "call"
+        else:
+            response_key = "step1" if phase == 0 else "step2"
         return InteractionDecision(
             duplicate=False,
             phase=1 if phase == 0 else 2,
