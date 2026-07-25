@@ -9,6 +9,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Boom } from '@hapi/boom';
 import QRCode from 'qrcode';
+import { createWhatsAppCallHandler } from './wa_call_handler.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = path.resolve(process.env.BOT_DIR || __dirname);
@@ -165,48 +166,23 @@ async function startBot() {
   });
 
   // ── Manejar llamadas entrantes ──
-  sock.ev.on('call', async (call) => {
-    if (call.status === 'offer') {
-      const jid = call.from;
-      console.log(`[WA ${jid}] CALL received (offer)`);
-
-      // Rechazar la llamada para que no siga sonando
-      try {
-        await sock.rejectCall(call.id, call.from);
-      } catch(e) {
-        console.error('[WA] Error rejecting call:', e.message);
+  // Baileys emite un arreglo WACallEvent[], incluso si solo hay una llamada.
+  const handleCallBatch = createWhatsAppCallHandler({
+    rejectCall: (callId, callFrom) => sock.rejectCall(callId, callFrom),
+    sendMessage: (jid, content) => sock.sendMessage(jid, content),
+    getCallMessage,
+    readAudio,
+    getLanguage: (call, replyJid) => {
+      const candidates = [replyJid, call.chatId, call.callerPn, call.from].filter(Boolean);
+      for (const jid of candidates) {
+        const state = userState.get(jid);
+        if (state && !isExpired(state)) return state.lang;
       }
-
-      // Detectar idioma
-      let lang = 'en';
-      const state = userState.get(jid);
-      if (state && !isExpired(state)) {
-        lang = state.lang;
-      }
-
-      const callMsg = getCallMessage(lang);
-      console.log(`[WA ${jid} lang=${lang}] CALL reply: "${callMsg.text.slice(0, 40)}"`);
-
-      // Enviar texto
-      await sock.sendMessage(jid, { text: callMsg.text });
-
-      // Enviar audio si existe
-      if (callMsg.audio) {
-        const audioBuffer = readAudio(callMsg.audio);
-        if (audioBuffer) {
-          try {
-            await sock.sendMessage(jid, {
-              audio: audioBuffer,
-              mimetype: 'audio/mpeg',
-              ptt: false,
-            });
-          } catch (err) {
-            console.error(`[WA] Error enviando audio de llamada a ${jid}:`, err.message);
-          }
-        }
-      }
-    }
+      return 'en';
+    },
+    logger: console,
   });
+  sock.ev.on('call', handleCallBatch);
 
   // ── Manejar mensajes entrantes ──
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
