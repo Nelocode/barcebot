@@ -29,6 +29,8 @@ const DELIVERY_STATES = new Set([
 ]);
 const PAYLOAD_STATES = new Set(['array', 'object', 'invalid', 'never']);
 const SIZE_STATES = new Set(['empty', 'one', 'multiple', 'never']);
+const TARGET_STATES = new Set(['caller_pn', 'chat_id', 'from', 'missing', 'not_applicable', 'never']);
+const TARGET_KIND_STATES = new Set(['pn', 'lid', 'other', 'missing', 'not_applicable', 'never']);
 
 function allowed(value, choices, fallback) {
   return typeof value === 'string' && choices.has(value) ? value : fallback;
@@ -64,6 +66,8 @@ function initialState(idFactory) {
       reject: 'never',
       text: 'never',
       audio: 'never',
+      target: 'never',
+      target_kind: 'never',
     },
   };
 }
@@ -148,6 +152,8 @@ export function createWhatsAppCallHealth({
             reject: allowed(metric.reject, DELIVERY_STATES, 'not_applicable'),
             text: allowed(metric.text, DELIVERY_STATES, 'not_applicable'),
             audio: allowed(metric.audio, DELIVERY_STATES, 'not_applicable'),
+            target: allowed(metric.target, TARGET_STATES, 'not_applicable'),
+            target_kind: allowed(metric.targetKind, TARGET_KIND_STATES, 'not_applicable'),
           };
           break;
         default:

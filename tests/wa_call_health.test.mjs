@@ -36,6 +36,8 @@ test('persiste solo un snapshot anonimizado y acotado', () => {
     reject: 'sent',
     text: 'sent',
     audio: 'sent',
+    target: 'caller_pn',
+    targetKind: 'pn',
     callId: 'call-1',
     replyJid: '573001234567@s.whatsapp.net',
     message: 'No podemos responder ahora',
@@ -50,6 +52,8 @@ test('persiste solo un snapshot anonimizado y acotado', () => {
   assert.equal(parsed.pipeline.event, 'offer');
   assert.equal(parsed.last_event, 'offer');
   assert.equal(parsed.pipeline.outcome, 'handled');
+  assert.equal(parsed.pipeline.target, 'caller_pn');
+  assert.equal(parsed.pipeline.target_kind, 'pn');
   assert.doesNotMatch(
     persisted,
     /573001234567|@s\.whatsapp\.net|call-1|No podemos|call\.mp3|phone|jid|callId|message|audioPath/,

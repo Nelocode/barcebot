@@ -1005,6 +1005,8 @@ _WA_CALL_HEALTH_DEFAULT = {
         "reject": "never",
         "text": "never",
         "audio": "never",
+        "target": "never",
+        "target_kind": "never",
     },
 }
 
@@ -1095,6 +1097,16 @@ def _read_wa_call_health():
         "reject": _safe_enum(pipeline.get("reject"), delivery, "not_applicable"),
         "text": _safe_enum(pipeline.get("text"), delivery, "not_applicable"),
         "audio": _safe_enum(pipeline.get("audio"), delivery, "not_applicable"),
+        "target": _safe_enum(
+            pipeline.get("target"),
+            {"caller_pn", "chat_id", "from", "missing", "not_applicable", "never"},
+            "not_applicable",
+        ),
+        "target_kind": _safe_enum(
+            pipeline.get("target_kind"),
+            {"pn", "lid", "other", "missing", "not_applicable", "never"},
+            "not_applicable",
+        ),
     }
     return result
 

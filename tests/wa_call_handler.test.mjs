@@ -173,6 +173,43 @@ test('usa chatId para responder y from para rechazar', async () => {
   assert.equal(effects[2][1], '573001234567@s.whatsapp.net');
 });
 
+test('prefiere callerPn para responder cuando chatId es un LID', async () => {
+  const { handler, effects, metrics } = createHarness();
+
+  await handler([
+    offer({
+      from: '12345@lid',
+      chatId: '12345@lid',
+      callerPn: '573001234567@s.whatsapp.net',
+    }),
+  ]);
+
+  assert.deepEqual(effects[0], ['reject', 'call-1', '12345@lid']);
+  assert.equal(effects[1][1], '573001234567@s.whatsapp.net');
+  assert.equal(effects[2][1], '573001234567@s.whatsapp.net');
+  const outcome = metrics.find((metric) => metric.type === 'outcome');
+  assert.equal(outcome.target, 'caller_pn');
+  assert.equal(outcome.targetKind, 'pn');
+});
+
+test('ignora callerPn malformado y cae a chatId', async () => {
+  const { handler, effects, metrics } = createHarness();
+
+  await handler([
+    offer({
+      from: '12345@lid',
+      chatId: '573001234567@s.whatsapp.net',
+      callerPn: 'not-a-phone@lid',
+    }),
+  ]);
+
+  assert.equal(effects[1][1], '573001234567@s.whatsapp.net');
+  assert.equal(effects[2][1], '573001234567@s.whatsapp.net');
+  const outcome = metrics.find((metric) => metric.type === 'outcome');
+  assert.equal(outcome.target, 'chat_id');
+  assert.equal(outcome.targetKind, 'pn');
+});
+
 test('tolera payload vacío o un objeto individual', async () => {
   const { handler, effects } = createHarness();
 

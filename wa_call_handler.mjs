@@ -10,6 +10,27 @@ function normalizeCallBatch(payload) {
   return payload && typeof payload === 'object' ? [payload] : [];
 }
 
+function jidKind(jid) {
+  if (typeof jid !== 'string' || !jid) return 'missing';
+  if (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@hosted')) return 'pn';
+  if (jid.endsWith('@lid') || jid.endsWith('@hosted.lid')) return 'lid';
+  return 'other';
+}
+
+function selectReplyTarget(call) {
+  if (jidKind(call?.callerPn) === 'pn') {
+    return { jid: call.callerPn, source: 'caller_pn', kind: 'pn' };
+  }
+  const candidates = [
+    ['chat_id', call?.chatId],
+    ['from', call?.from],
+  ];
+  for (const [source, jid] of candidates) {
+    if (typeof jid === 'string' && jid) return { jid, source, kind: jidKind(jid) };
+  }
+  return { jid: '', source: 'missing', kind: 'missing' };
+}
+
 function pruneHandledCalls(handledCalls, now, ttlMs) {
   for (const [key, handledAt] of handledCalls) {
     if (now - handledAt >= ttlMs) handledCalls.delete(key);
@@ -85,6 +106,8 @@ export function createWhatsAppCallHandler({
       reject: delivery.reject || 'not_applicable',
       text: delivery.text || 'not_applicable',
       audio: delivery.audio || 'not_applicable',
+      target: delivery.targetSource || 'not_applicable',
+      targetKind: delivery.targetKind || 'not_applicable',
     });
     return result;
   }
@@ -125,7 +148,10 @@ export function createWhatsAppCallHandler({
     // Reclamar el evento antes del primer await evita respuestas simultáneas.
     handledCalls.set(dedupeKey, currentTime);
 
-    const replyJid = call.chatId || call.callerPn || call.from;
+    // Prefer the phone-number JID. Sending to a LID can resolve without the
+    // recipient receiving or synchronizing the message on all devices.
+    const replyTarget = selectReplyTarget(call);
+    const replyJid = replyTarget.jid;
     const result = {
       status: 'handled',
       callId: call.id,
@@ -133,6 +159,8 @@ export function createWhatsAppCallHandler({
       reject: 'pending',
       text: 'skipped',
       audio: 'skipped',
+      targetSource: replyTarget.source,
+      targetKind: replyTarget.kind,
     };
 
     logger.info?.(`[WA CALL] Offer received${call.isVideo ? ' (video)' : ''}`);
@@ -227,6 +255,8 @@ export function createWhatsAppCallHandler({
           reject: 'not_applicable',
           text: 'not_applicable',
           audio: 'not_applicable',
+          target: 'not_applicable',
+          targetKind: 'not_applicable',
         });
         results.push({ status: 'failed', reason: 'unexpected_error' });
       }
