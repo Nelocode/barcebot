@@ -23,6 +23,12 @@ from telegram_audio_branding import (
     resolve_audio_branding,
     save_audio_branding_settings,
 )
+from test_mode import (
+    interaction_state_summary,
+    load_test_mode,
+    reset_latest_interaction,
+    save_test_mode,
+)
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -46,6 +52,10 @@ WA_SWITCH_PID_FILE = WA_SWITCH_DIR / "worker.pid"
 WA_SWITCH_OPERATION_FILE = WA_SWITCH_DIR / "operation.json"
 WA_SWITCH_RECOVERY_ROOT = DATA_DIR / ".wa_switch_recovery"
 WA_SWITCH_TIMEOUT_SECONDS = 180
+TG_INTERACTION_STATE_FILE = DATA_DIR / "tg_interaction_state.json"
+WA_INTERACTION_STATE_FILE = DATA_DIR / "wa_interaction_state.json"
+TEST_MODE_FILE = DATA_DIR / "test_mode.json"
+TEST_MODE_BACKUP_DIR = DATA_DIR / "test_mode_backups"
 
 def _load_or_create_flask_secret() -> str:
     configured = os.environ.get("FLASK_SECRET")
@@ -87,6 +97,7 @@ _telegram_switch_auth = TelegramAuthManager(str(TG_SWITCH_SESSION_BASE))
 _telegram_switch_lock = threading.RLock()
 _wa_process_lock = threading.RLock()
 _wa_switch_lock = threading.RLock()
+_test_mode_lock = threading.RLock()
 _wa_switch_expiry_timer: threading.Timer | None = None
 
 # ── HTML Template (todo en uno para portabilidad) ───────────────────
@@ -311,6 +322,46 @@ label { color: #c8c8e0 !important; font-weight: 500; }
     </div>
   </div>
 
+  <!-- Test mode -->
+  <div id="test-mode-card" class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <span>🧪 Modo de prueba de conversaciones</span>
+      <span id="test-mode-badge" class="badge bg-secondary">Desactivado</span>
+    </div>
+    <div class="card-body">
+      <p class="small text-muted mb-2">
+        Permite que el mismo celular vuelva a recibir Paso 1 y pruebe otro idioma o escenario.
+        Por privacidad, el panel no guarda el número: reinicia la conversación más reciente de
+        cada canal, sin desvincular Telegram ni WhatsApp.
+      </p>
+      <p id="test-mode-summary" class="small mb-3">Cargando estado…</p>
+      <div class="d-flex align-items-center gap-2 mb-3">
+        <label for="test-mode-language" class="small mb-0">Idioma al volver a Paso 1:</label>
+        <select id="test-mode-language" class="form-select form-select-sm" style="max-width:220px;">
+          <option value="auto">Detectar por el próximo texto</option>
+          <option value="es">Español</option>
+          <option value="en">English</option>
+          <option value="fr">Français</option>
+        </select>
+      </div>
+      <div class="d-flex flex-wrap gap-2">
+        <button id="test-mode-toggle" class="btn btn-sm btn-outline-light" onclick="toggleTestMode()" disabled>
+          Activar modo de prueba
+        </button>
+        <button class="btn btn-sm btn-primary test-reset-button" onclick="resetTestConversation('telegram')" disabled>
+          Reiniciar última de Telegram
+        </button>
+        <button class="btn btn-sm btn-primary test-reset-button" onclick="resetTestConversation('whatsapp')" disabled>
+          Reiniciar última de WhatsApp
+        </button>
+        <button class="btn btn-sm btn-danger test-reset-button" onclick="resetTestConversation('both')" disabled>
+          Reiniciar ambas
+        </button>
+      </div>
+      <div id="test-mode-status" class="small text-muted mt-2"></div>
+    </div>
+  </div>
+
   <!-- WhatsApp QR (hidden by default) -->
   <div id="wa-qr-card" class="card" style="display:none;">
     <div class="card-header d-flex justify-content-between align-items-center">
@@ -369,6 +420,7 @@ let waCommitInFlight = false;
 let waSwitchGeneration = 0;
 let waSwitchPollAbortController = null;
 let tgAudioBrandingDirty = false;
+let testModeState = null;
 
 function toast(msg, type="success") {
   const c = document.getElementById("toast-container");
@@ -1426,9 +1478,102 @@ async function cancelWaSwitch() {
   await loadChannelState();
 }
 
+function renderTestModeState(data) {
+  testModeState = data;
+  const enabled = Boolean(data && data.enabled);
+  const canManage = Boolean(data && data.can_manage);
+  const badge = document.getElementById("test-mode-badge");
+  const toggle = document.getElementById("test-mode-toggle");
+  const summary = document.getElementById("test-mode-summary");
+  badge.className = enabled ? "badge bg-success" : "badge bg-secondary";
+  badge.textContent = enabled ? "Activado" : "Desactivado";
+  toggle.disabled = !canManage;
+  toggle.textContent = enabled ? "Desactivar modo de prueba" : "Activar modo de prueba";
+  document.querySelectorAll(".test-reset-button").forEach(button => {
+    button.disabled = !canManage || !enabled;
+  });
+  const tgCount = data?.telegram?.conversation_count ?? 0;
+  const waCount = data?.whatsapp?.conversation_count ?? 0;
+  summary.textContent = canManage
+    ? `Conversaciones guardadas: Telegram ${tgCount} · WhatsApp ${waCount}. ` +
+      "El botón reinicia únicamente la más reciente y conserva un respaldo del estado anterior."
+    : "Confirma primero una cuenta vinculada para administrar el modo de prueba.";
+}
+
+async function loadTestMode() {
+  try {
+    const response = await fetch("/api/test_mode", {cache: "no-store"});
+    const data = await response.json();
+    if (response.ok && data.ok) renderTestModeState(data);
+    return data;
+  } catch (error) {
+    document.getElementById("test-mode-status").textContent =
+      "No fue posible consultar el modo de prueba.";
+    return null;
+  }
+}
+
+async function toggleTestMode() {
+  const enabled = !(testModeState && testModeState.enabled);
+  const action = enabled ? "activar" : "desactivar";
+  if (!confirm(`¿Quieres ${action} el modo de prueba?`)) return;
+  const toggle = document.getElementById("test-mode-toggle");
+  toggle.disabled = true;
+  try {
+    const response = await fetch("/api/test_mode", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: JSON.stringify({enabled}),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || "No fue posible cambiar el modo");
+    renderTestModeState(data);
+    toast(enabled ? "🧪 Modo de prueba activado" : "Modo de prueba desactivado", "success");
+  } catch (error) {
+    toast("❌ " + error.message, "error");
+    await loadTestMode();
+  }
+}
+
+async function resetTestConversation(channel) {
+  const channelLabel = channel === "both" ? "Telegram y WhatsApp" :
+    channel === "telegram" ? "Telegram" : "WhatsApp";
+  const language = document.getElementById("test-mode-language").value;
+  const languageLabel = language === "auto" ? "detección automática" : language.toUpperCase();
+  if (!confirm(
+    `Se reiniciará la conversación más reciente de ${channelLabel}. ` +
+    `La próxima interacción recibirá Paso 1 con ${languageLabel}. ¿Continuar?`
+  )) return;
+  document.querySelectorAll(".test-reset-button").forEach(button => button.disabled = true);
+  const status = document.getElementById("test-mode-status");
+  status.textContent = "Reiniciando estado y recargando los servicios activos…";
+  try {
+    const response = await fetch("/api/test_mode/reset", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: JSON.stringify({channel, language, confirm: true}),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || "No fue posible reiniciar la conversación");
+    const resetChannels = Object.entries(data.results || {})
+      .filter(([, result]) => result.reset)
+      .map(([name]) => name === "telegram" ? "Telegram" : "WhatsApp");
+    status.textContent = resetChannels.length
+      ? `Listo: ${resetChannels.join(" y ")} comenzará desde Paso 1.`
+      : "No había conversaciones guardadas para reiniciar.";
+    toast(status.textContent, "success");
+    await Promise.all([loadTestMode(), loadData()]);
+  } catch (error) {
+    status.textContent = error.message;
+    toast("❌ " + error.message, "error");
+    await loadTestMode();
+  }
+}
+
 // Auto-refresh cada 10 segundos
 loadData();
 loadChannelState();
+loadTestMode();
 setInterval(loadData, 10000);
 // Auto-iniciar BotFather si hay token configurado
 fetch("/api/start_botfather", {method:"POST"}).catch(()=>{});
@@ -3081,6 +3226,137 @@ def restart_wa_bot() -> int | None:
             link_only=False,
             log_name="bot_wa.log",
         )
+
+
+def _test_mode_payload() -> dict:
+    can_manage = _can_manage_channels()
+    empty_summary = {"conversation_count": 0, "latest_updated_at": None}
+    return {
+        "ok": True,
+        "enabled": load_test_mode(TEST_MODE_FILE),
+        "can_manage": can_manage,
+        "telegram": interaction_state_summary(TG_INTERACTION_STATE_FILE) if can_manage else empty_summary,
+        "whatsapp": interaction_state_summary(WA_INTERACTION_STATE_FILE) if can_manage else empty_summary,
+    }
+
+
+def _test_mode_switch_conflict(channels: list[str]) -> str | None:
+    if "telegram" in channels and _telegram_switch_auth.has_pending():
+        return "Termina o cancela primero el cambio de cuenta de Telegram."
+    if "whatsapp" in channels:
+        with _wa_switch_lock:
+            _reap_expired_wa_switch()
+            if _load_wa_switch_operation():
+                return "Termina o cancela primero el cambio de cuenta de WhatsApp."
+    return None
+
+
+@app.route("/api/test_mode", methods=["GET", "POST"])
+def api_test_mode():
+    if request.method == "GET":
+        response = jsonify(_test_mode_payload())
+        response.headers["Cache-Control"] = "no-store, private"
+        return response
+
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
+        return jsonify({"ok": False, "error": "enabled debe ser true o false."}), 400
+    with _test_mode_lock:
+        save_test_mode(TEST_MODE_FILE, data["enabled"])
+    return jsonify(_test_mode_payload())
+
+
+@app.route("/api/test_mode/reset", methods=["POST"])
+def api_test_mode_reset():
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    if not load_test_mode(TEST_MODE_FILE):
+        return jsonify({
+            "ok": False,
+            "error_code": "test_mode_disabled",
+            "error": "Activa primero el modo de prueba.",
+        }), 409
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or data.get("confirm") is not True:
+        return jsonify({"ok": False, "error": "Confirma explícitamente el reinicio."}), 400
+    selected = data.get("channel")
+    if selected not in {"telegram", "whatsapp", "both"}:
+        return jsonify({"ok": False, "error": "Canal de prueba inválido."}), 400
+    selected_language = data.get("language", "auto")
+    if selected_language not in {"auto", "es", "en", "fr"}:
+        return jsonify({"ok": False, "error": "Idioma de prueba inválido."}), 400
+    preset_language = None if selected_language == "auto" else selected_language
+    channels = ["telegram", "whatsapp"] if selected == "both" else [selected]
+    conflict = _test_mode_switch_conflict(channels)
+    if conflict:
+        return jsonify({"ok": False, "error_code": "account_switch_in_progress", "error": conflict}), 409
+
+    state_paths = {
+        "telegram": TG_INTERACTION_STATE_FILE,
+        "whatsapp": WA_INTERACTION_STATE_FILE,
+    }
+    results = {}
+    restart_warnings = []
+    with _test_mode_lock:
+        pending = [
+            channel for channel in channels
+            if interaction_state_summary(state_paths[channel])["conversation_count"] > 0
+        ]
+        telegram_was_running = False
+        whatsapp_was_running = False
+        if "telegram" in pending:
+            telegram_pid = _tracked_telegram_pid()
+            telegram_was_running = bool(telegram_pid and _is_telegram_worker_pid(telegram_pid))
+            if telegram_was_running:
+                _stop_telegram_worker()
+        if "whatsapp" in pending:
+            whatsapp_pid_file = DATA_DIR / "wa_bot.pid"
+            whatsapp_was_running = _wa_process_running(whatsapp_pid_file)
+            if whatsapp_was_running:
+                _stop_wa_process(whatsapp_pid_file)
+
+        try:
+            for channel in channels:
+                result = reset_latest_interaction(
+                    state_paths[channel],
+                    channel=channel,
+                    backup_dir=TEST_MODE_BACKUP_DIR,
+                    language=preset_language,
+                )
+                results[channel] = {
+                    "reset": result["reset"],
+                    "remaining": result["remaining"],
+                    "language": selected_language,
+                    "backup_created": bool(result["backup"]),
+                }
+        except OSError:
+            return jsonify({
+                "ok": False,
+                "error": "No fue posible guardar el estado de prueba; los respaldos existentes se conservaron.",
+            }), 500
+        finally:
+            if telegram_was_running:
+                started, message = restart_telegram_worker()
+                if not started:
+                    restart_warnings.append(f"Telegram: {message}")
+            if whatsapp_was_running and not restart_wa_bot():
+                restart_warnings.append("WhatsApp no pudo reiniciarse automáticamente.")
+
+    response = {
+        "ok": not restart_warnings,
+        "results": results,
+        "restart_warnings": restart_warnings,
+        "state": _test_mode_payload(),
+    }
+    if restart_warnings:
+        response["error"] = "El estado se reinició, pero un servicio requiere reinicio manual."
+        return jsonify(response), 503
+    return jsonify(response)
 
 
 def _wa_switch_token_digest(token: str) -> str:

@@ -50,6 +50,18 @@ class AdminTemplateTestCase(unittest.TestCase):
             self.assertIn(endpoint, app_module.TEMPLATE)
         self.assertNotIn('fetch("/api/reset_wa"', app_module.TEMPLATE)
 
+    def test_test_mode_can_reset_each_latest_conversation_from_the_panel(self):
+        template = app_module.TEMPLATE
+        self.assertIn('id="test-mode-card"', template)
+        self.assertIn('fetch("/api/test_mode"', template)
+        self.assertIn('fetch("/api/test_mode/reset"', template)
+        self.assertIn("resetTestConversation('telegram')", template)
+        self.assertIn("resetTestConversation('whatsapp')", template)
+        self.assertIn("resetTestConversation('both')", template)
+        self.assertIn('id="test-mode-language"', template)
+        self.assertIn("headers: channelHeaders()", template)
+        self.assertIn("body: JSON.stringify({channel, language, confirm: true})", template)
+
     def test_whatsapp_cancel_invalidates_poll_and_cannot_race_commit(self):
         template = app_module.TEMPLATE
         self.assertIn("let waSwitchGeneration = 0;", template)

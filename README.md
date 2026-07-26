@@ -43,6 +43,27 @@ Una vez desplegado:
 2. **WhatsApp:** Escanea el código QR proyectado en el panel para vincular la cuenta.
 3. **Configuraciones:** Gestiona los mensajes en tiempo real, audios pregrabados y parámetros del bot.
 
+### Modo de prueba de conversaciones
+
+El panel incluye un modo de prueba reversible para repetir el flujo completo con
+el mismo celular:
+
+1. Vincula y confirma los canales desde el navegador administrador.
+2. Envía una interacción desde el celular de prueba para que sea la conversación
+   más reciente del canal.
+3. Activa **Modo de prueba de conversaciones** en el panel.
+4. Elige detección automática, español, inglés o francés. Seleccionar un idioma
+   permite probar una llamada como primera interacción, aunque no contenga texto.
+5. Reinicia la conversación más reciente de Telegram, WhatsApp o ambas.
+6. La siguiente interacción de ese celular empezará nuevamente en **Paso 1** y
+   usará el idioma seleccionado o lo detectará desde el próximo texto.
+
+El reinicio no desvincula cuentas ni elimina credenciales. Antes de cambiar el
+estado, conserva una copia en `/app/data/test_mode_backups`. Como el sistema no
+guarda números de clientes en claro, esta herramienta identifica la conversación
+por su actividad más reciente; no debe usarse mientras haya tráfico real de otros
+clientes.
+
 ---
 
 ## 🛠️ Arquitectura Técnica
