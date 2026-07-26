@@ -63,18 +63,27 @@ class AdminTemplateTestCase(unittest.TestCase):
             len(re.findall(r'class="[^"]*\bwa-switch-cancel\b[^"]*"', template)),
         )
 
-    def test_telegram_audio_performer_is_editable_without_html_injection(self):
+    def test_both_telegram_audio_texts_are_editable_without_html_injection(self):
         template = app_module.TEMPLATE
         self.assertIn('id="tg-audio-performer"', template)
-        self.assertIn('maxlength="80"', template)
+        self.assertIn('id="tg-audio-title"', template)
+        self.assertEqual(2, template.count('maxlength="80"'))
         self.assertIn('fetch("/api/telegram_audio_branding"', template)
+        self.assertIn('fetch("/api/data", {cache: "no-store"})', template)
         self.assertIn("headers: channelHeaders()", template)
+        self.assertIn("JSON.stringify({title, performer})", template)
         self.assertIn("let tgAudioBrandingDirty = false", template)
-        self.assertIn("!tgAudioBrandingDirty && document.activeElement !== input", template)
-        self.assertIn("input.value = performer", template)
+        self.assertIn("if (tgAudioBrandingDirty)", template)
+        self.assertEqual(2, template.count('oninput="markTelegramAudioBrandingDirty()"'))
+        self.assertIn("function markTelegramAudioBrandingDirty()", template)
+        self.assertIn("performerInput.value = performer", template)
+        self.assertIn("titleInput.value = title", template)
+        self.assertIn("performerInput.value.trim()", template)
+        self.assertIn("titleInput.value.trim()", template)
         self.assertIn("preview.textContent = performer", template)
         self.assertIn("brandingSave.disabled = !data.can_manage", template)
         self.assertNotIn("preview.innerHTML = performer", template)
+        self.assertNotIn("Cambios toman efecto al reiniciar el bot", template)
 
 
 if __name__ == "__main__":

@@ -230,16 +230,28 @@ label { color: #c8c8e0 !important; font-weight: 500; }
       <hr class="my-3">
       <h6 class="mb-2">🎵 Presentación de los audios en Telegram</h6>
       <p class="small text-muted mb-2">
-        Edita el nombre de la agencia que aparece en la tarjeta del audio. El cambio
-        se aplica al siguiente envío y se conserva después de redesplegar.
+        Edita los dos textos que aparecen en la tarjeta del audio. Los cambios se
+        aplican al siguiente envío y se conservan después de redesplegar.
       </p>
-      <div class="d-flex align-items-center gap-2">
-        <input id="tg-audio-performer" type="text" maxlength="80"
-               class="form-control form-control-sm"
-               placeholder="Caché Barcelona" aria-label="Nombre mostrado en los audios de Telegram"
-               oninput="tgAudioBrandingDirty = true">
+      <div class="row g-2">
+        <div class="col-md-6">
+          <label for="tg-audio-performer" class="form-label small">Nombre de la agencia</label>
+          <input id="tg-audio-performer" type="text" maxlength="80"
+                 class="form-control form-control-sm"
+                 placeholder="Caché Barcelona"
+                 oninput="markTelegramAudioBrandingDirty()">
+        </div>
+        <div class="col-md-6">
+          <label for="tg-audio-title" class="form-label small">Título del audio</label>
+          <input id="tg-audio-title" type="text" maxlength="80"
+                 class="form-control form-control-sm"
+                 placeholder="Las Fiesteras"
+                 oninput="markTelegramAudioBrandingDirty()">
+        </div>
+      </div>
+      <div class="mt-2">
         <button id="tg-audio-branding-save" class="btn btn-sm btn-success"
-                onclick="saveTelegramAudioBranding()" disabled>💾 Guardar nombre</button>
+                onclick="saveTelegramAudioBranding()" disabled>💾 Guardar textos</button>
       </div>
       <div id="tg-audio-branding-preview" class="small text-muted mt-2"></div>
       <div id="tg-audio-branding-status" class="small text-muted mt-1"></div>
@@ -337,7 +349,7 @@ label { color: #c8c8e0 !important; font-weight: 500; }
     <span class="mx-2">·</span>
     <span>🎵 Audios en <code>audios/</code></span>
     <span class="mx-2">·</span>
-    <span>🔄 Cambios toman efecto al reiniciar el bot</span>
+    <span>⚡ Los cambios se aplican automáticamente</span>
   </div>
 </div>
 
@@ -369,7 +381,7 @@ function toast(msg, type="success") {
 
 async function loadData() {
   try {
-    const r = await fetch("/api/data");
+    const r = await fetch("/api/data", {cache: "no-store"});
     const data = await r.json();
     renderSteps(data);
     renderTelegramAudioBranding(data.telegram_audio_branding || {});
@@ -382,25 +394,57 @@ async function loadData() {
 }
 
 function renderTelegramAudioBranding(branding) {
-  const input = document.getElementById("tg-audio-performer");
+  const performerInput = document.getElementById("tg-audio-performer");
+  const titleInput = document.getElementById("tg-audio-title");
   const preview = document.getElementById("tg-audio-branding-preview");
-  if (!input || !preview) return;
+  if (!performerInput || !titleInput || !preview) return;
+  if (tgAudioBrandingDirty) {
+    renderTelegramAudioBrandingPreview(
+      performerInput.value.trim(),
+      titleInput.value.trim()
+    );
+    return;
+  }
   const performer = String(branding.performer || "");
   const title = String(branding.title || "Las Fiesteras");
-  if (!tgAudioBrandingDirty && document.activeElement !== input) input.value = performer;
-  preview.textContent = performer
+  performerInput.value = performer;
+  titleInput.value = title;
+  renderTelegramAudioBrandingPreview(performer, title);
+}
+
+function renderTelegramAudioBrandingPreview(performer, title) {
+  const preview = document.getElementById("tg-audio-branding-preview");
+  if (!preview) return;
+  preview.textContent = performer && title
     ? `Vista previa: ${performer} — ${title}`
-    : "Escribe el nombre que debe aparecer en Telegram.";
+    : "Completa ambos textos para ver cómo aparecerán en Telegram.";
+}
+
+function markTelegramAudioBrandingDirty() {
+  tgAudioBrandingDirty = true;
+  const performerInput = document.getElementById("tg-audio-performer");
+  const titleInput = document.getElementById("tg-audio-title");
+  renderTelegramAudioBrandingPreview(
+    performerInput ? performerInput.value.trim() : "",
+    titleInput ? titleInput.value.trim() : ""
+  );
 }
 
 async function saveTelegramAudioBranding() {
-  const input = document.getElementById("tg-audio-performer");
+  const performerInput = document.getElementById("tg-audio-performer");
+  const titleInput = document.getElementById("tg-audio-title");
   const button = document.getElementById("tg-audio-branding-save");
   const status = document.getElementById("tg-audio-branding-status");
-  const performer = input.value.trim();
+  const performer = performerInput.value.trim();
+  const title = titleInput.value.trim();
   if (!performer) {
     toast("❌ Escribe el nombre de la agencia", "error");
-    input.focus();
+    performerInput.focus();
+    return;
+  }
+  if (!title) {
+    toast("❌ Escribe el título del audio", "error");
+    titleInput.focus();
     return;
   }
 
@@ -410,14 +454,14 @@ async function saveTelegramAudioBranding() {
     const r = await fetch("/api/telegram_audio_branding", {
       method: "POST",
       headers: channelHeaders(),
-      body: JSON.stringify({performer})
+      body: JSON.stringify({title, performer})
     });
     const data = await r.json();
-    if (!r.ok || !data.ok) throw new Error(data.error || "No fue posible guardar el nombre");
+    if (!r.ok || !data.ok) throw new Error(data.error || "No fue posible guardar los textos");
     tgAudioBrandingDirty = false;
     renderTelegramAudioBranding(data);
     status.textContent = "✅ Se aplicará al próximo audio de Telegram.";
-    toast("✅ Nombre de los audios actualizado", "success");
+    toast("✅ Textos de los audios actualizados", "success");
   } catch(e) {
     status.textContent = "❌ " + e.message;
     toast("❌ " + e.message, "error");
@@ -805,7 +849,7 @@ function renderChannelState(data) {
   tgSwitchOpen.disabled = !data.can_manage || tg.state === "recovery_required";
   brandingSave.disabled = !data.can_manage;
   if (!data.can_manage) {
-    brandingStatus.textContent = "🔐 Confirma la cuenta de Telegram para editar este nombre.";
+    brandingStatus.textContent = "🔐 Confirma la cuenta de Telegram para editar estos textos.";
   } else if (brandingStatus.textContent.startsWith("🔐")) {
     brandingStatus.textContent = "";
   }
@@ -1967,7 +2011,7 @@ def api_data():
 
 @app.route("/api/telegram_audio_branding", methods=["GET", "POST"])
 def api_telegram_audio_branding():
-    """Lee o guarda el nombre mostrado en las tarjetas de audio de Telegram."""
+    """Lee o guarda los textos mostrados en las tarjetas de audio de Telegram."""
 
     if request.method == "GET":
         response = jsonify({"ok": True, **load_telegram_audio_branding()})
@@ -1981,16 +2025,20 @@ def api_telegram_audio_branding():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"ok": False, "error": "No se recibió una configuración válida."}), 400
+    if "title" not in data and "performer" not in data:
+        return jsonify({"ok": False, "error": "No se recibió ningún texto para actualizar."}), 400
 
     try:
+        current = load_telegram_audio_branding()
         save_audio_branding_settings(
             TG_AUDIO_BRANDING_SETTINGS_FILE,
-            performer=data.get("performer"),
+            title=data.get("title", current["title"]),
+            performer=data.get("performer", current["performer"]),
         )
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     except OSError:
-        return jsonify({"ok": False, "error": "No fue posible guardar la marca del audio."}), 500
+        return jsonify({"ok": False, "error": "No fue posible guardar los textos del audio."}), 500
 
     return jsonify({
         "ok": True,

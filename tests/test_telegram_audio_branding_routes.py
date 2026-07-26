@@ -54,7 +54,7 @@ class TelegramAudioBrandingRoutesTests(unittest.TestCase):
     def test_write_requires_admin_browser_and_csrf(self):
         anonymous = self.client.post(
             "/api/telegram_audio_branding",
-            json={"performer": "No autorizado"},
+            json={"title": "Sin permiso", "performer": "No autorizado"},
             headers=self.headers(),
         )
         self.assertEqual(403, anonymous.status_code)
@@ -64,10 +64,19 @@ class TelegramAudioBrandingRoutesTests(unittest.TestCase):
         self.authorize_browser()
         missing_csrf = self.client.post(
             "/api/telegram_audio_branding",
-            json={"performer": "Sin CSRF"},
+            json={"title": "Sin permiso", "performer": "Sin CSRF"},
         )
         self.assertEqual(403, missing_csrf.status_code)
         self.assertEqual("csrf_invalid", missing_csrf.get_json()["error_code"])
+        self.assertFalse(self.settings_file.exists())
+
+        invalid_csrf = self.client.post(
+            "/api/telegram_audio_branding",
+            json={"title": "Sin permiso", "performer": "Sin CSRF"},
+            headers=self.headers("x" * 48),
+        )
+        self.assertEqual(403, invalid_csrf.status_code)
+        self.assertEqual("csrf_invalid", invalid_csrf.get_json()["error_code"])
         self.assertFalse(self.settings_file.exists())
 
     def test_write_trims_persists_and_applies_without_restarting_workers(self):
@@ -78,38 +87,99 @@ class TelegramAudioBrandingRoutesTests(unittest.TestCase):
         ):
             response = self.client.post(
                 "/api/telegram_audio_branding",
-                json={"performer": "  Mi Caché Barcelona  "},
+                json={
+                    "title": "  Experiencia Barcelona  ",
+                    "performer": "  Mi Caché Barcelona  ",
+                },
                 headers=self.headers(),
             )
 
         self.assertEqual(200, response.status_code)
         payload = response.get_json()
         self.assertTrue(payload["ok"])
+        self.assertEqual("Experiencia Barcelona", payload["title"])
         self.assertEqual("Mi Caché Barcelona", payload["performer"])
+        expected = {
+            "title": "Experiencia Barcelona",
+            "performer": "Mi Caché Barcelona",
+        }
         self.assertEqual(
-            {"performer": "Mi Caché Barcelona"},
+            expected,
             json.loads(self.settings_file.read_text(encoding="utf-8")),
         )
         restart_telegram.assert_not_called()
         restart_whatsapp.assert_not_called()
 
-    def test_invalid_value_does_not_replace_previous_setting(self):
+    def test_invalid_values_do_not_replace_previous_setting(self):
         self.settings_file.write_text(
-            json.dumps({"performer": "Caché Barcelona"}, ensure_ascii=False),
+            json.dumps(
+                {"title": "Las Fiesteras", "performer": "Caché Barcelona"},
+                ensure_ascii=False,
+            ),
             encoding="utf-8",
         )
         original = self.settings_file.read_bytes()
         self.authorize_browser()
 
-        response = self.client.post(
+        for payload in (
+            {
+                "title": "Barcelona\nTG_API_HASH=injected",
+                "performer": "Caché Barcelona",
+            },
+            {
+                "title": "Las Fiesteras",
+                "performer": "Barcelona\nTG_API_HASH=injected",
+            },
+        ):
+            with self.subTest(payload=payload):
+                response = self.client.post(
+                    "/api/telegram_audio_branding",
+                    json=payload,
+                    headers=self.headers(),
+                )
+                self.assertEqual(400, response.status_code)
+                self.assertFalse(response.get_json()["ok"])
+                self.assertEqual(original, self.settings_file.read_bytes())
+
+    def test_partial_update_preserves_the_other_effective_value(self):
+        self.authorize_browser()
+        performer_only = self.client.post(
             "/api/telegram_audio_branding",
-            json={"performer": "Barcelona\nTG_API_HASH=injected"},
+            json={"performer": "Agencia actualizada"},
             headers=self.headers(),
         )
+        self.assertEqual(200, performer_only.status_code)
+        self.assertEqual("Las Fiesteras", performer_only.get_json()["title"])
+        self.assertEqual("Agencia actualizada", performer_only.get_json()["performer"])
 
-        self.assertEqual(400, response.status_code)
-        self.assertFalse(response.get_json()["ok"])
-        self.assertEqual(original, self.settings_file.read_bytes())
+        title_only = self.client.post(
+            "/api/telegram_audio_branding",
+            json={"title": "Título actualizado"},
+            headers=self.headers(),
+        )
+        self.assertEqual(200, title_only.status_code)
+        self.assertEqual("Título actualizado", title_only.get_json()["title"])
+        self.assertEqual("Agencia actualizada", title_only.get_json()["performer"])
+
+    def test_empty_update_is_rejected(self):
+        self.authorize_browser()
+        responses = (
+            self.client.post(
+                "/api/telegram_audio_branding",
+                json={},
+                headers=self.headers(),
+            ),
+            self.client.post(
+                "/api/telegram_audio_branding",
+                json=[],
+                headers=self.headers(),
+            ),
+        )
+
+        for response in responses:
+            self.assertEqual(400, response.status_code)
+            self.assertFalse(response.get_json()["ok"])
+        self.assertFalse(self.settings_file.exists())
 
 
 if __name__ == "__main__":

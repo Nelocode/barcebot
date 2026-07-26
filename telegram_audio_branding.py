@@ -93,25 +93,38 @@ def resolve_audio_branding(
 def save_audio_branding_settings(
     settings_path: str | Path,
     *,
+    title: object,
     performer: object,
 ) -> dict[str, str]:
-    """Validate and atomically persist the performer edited in the panel."""
+    """Validate and atomically persist both labels edited in the panel."""
 
-    normalized = _branding_text(performer)
-    if normalized is None:
+    normalized_title = _branding_text(title)
+    if normalized_title is None:
         raise ValueError(
-            f"El nombre debe tener entre 1 y {AUDIO_BRANDING_MAX_LENGTH} caracteres visibles."
+            f"El título debe tener entre 1 y {AUDIO_BRANDING_MAX_LENGTH} caracteres visibles."
+        )
+    normalized_performer = _branding_text(performer)
+    if normalized_performer is None:
+        raise ValueError(
+            f"El nombre de la agencia debe tener entre 1 y {AUDIO_BRANDING_MAX_LENGTH} caracteres visibles."
         )
 
     destination = Path(settings_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"performer": normalized}
+    payload = {
+        "title": normalized_title,
+        "performer": normalized_performer,
+    }
     temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, destination)
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, destination)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        raise
     return payload
 
 

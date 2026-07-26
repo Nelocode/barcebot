@@ -1,19 +1,19 @@
 # Marca de los audios de Telegram
 
-La rama `cache-barcelona-branding` incluye esta presentación inicial:
+El repositorio de Barcelona incluye esta presentación inicial:
 
 - título: `Las Fiesteras`;
 - intérprete: `Caché Barcelona`;
 - portada: `assets/audio-cover.jpg`.
 
-El intérprete puede editarse desde **Configurar > Presentación de los audios
-en Telegram**. El panel guarda el valor en
+El título y el nombre de la agencia pueden editarse desde **Configurar >
+Presentación de los audios en Telegram**. El panel guarda ambos valores en
 `data/telegram_audio_branding.json`, dentro del volumen persistente. El worker
 lee ese archivo al preparar cada envío, por lo que el cambio se aplica al
 próximo audio sin reiniciar Telegram ni redesplegar el servicio.
 
-La rama `master` no contiene el valor predeterminado de Barcelona y Caché
-Madrid conserva su configuración actual.
+El repositorio de Madrid permanece separado y no lee este archivo de
+configuración.
 
 ## Variables opcionales
 
@@ -25,7 +25,7 @@ Madrid conserva su configuración actual.
 
 La precedencia para título e intérprete, de menor a mayor, es: respaldo del
 código, valores empaquetados para Barcelona, variables de Easypanel y valor
-guardado desde el panel. Por eso el valor elegido en el panel no se pierde al
+guardado desde el panel. Por eso los valores elegidos en el panel no se pierden al
 reiniciar o redesplegar.
 
 Las rutas relativas de portada se resuelven desde la raíz de la aplicación
