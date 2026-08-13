@@ -7,6 +7,7 @@ import path from 'path';
 import { PersistentInteractionState } from '../interaction_state.mjs';
 import { createWhatsAppMessageHandler, describeInteraction } from '../wa_message_handler.mjs';
 import { KeyedSerialQueue } from '../keyed_serial_queue.mjs';
+import { detectLanguage } from '../language_detection.mjs';
 
 function incoming(id, message, overrides = {}) {
   return {
@@ -87,6 +88,78 @@ test('imagen con descripción cuenta una sola vez y fija el idioma', async () =>
 
   assert.equal(effects.length, 2);
   assert.equal(effects[0][1].text, 'step1');
+});
+
+test('imagen sin texto usa +57 provisional y un texto inglés posterior lo reemplaza', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-message-language-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const deliveredLanguages = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => {},
+    routeInteraction: details => state.register(details),
+    getResponseMessage: (language, key) => {
+      deliveredLanguages.push([language, key]);
+      return { text: key, audio: '' };
+    },
+    readAudio: async () => null,
+    detectLanguage: text => text === 'hello' ? 'en' : null,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await handler({ type: 'notify', messages: [incoming('image', { imageMessage: {} })] });
+  await handler({ type: 'notify', messages: [incoming('text', { conversation: 'hello' })] });
+
+  assert.deepEqual(deliveredLanguages, [['es', 'step1'], ['en', 'step2']]);
+});
+
+test('caption con empate no confirma idioma y texto claro posterior lo reemplaza', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-message-tied-language-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const deliveredLanguages = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => {},
+    routeInteraction: details => state.register(details),
+    getResponseMessage: (language, key) => {
+      deliveredLanguages.push([language, key]);
+      return { text: key, audio: '' };
+    },
+    readAudio: async () => null,
+    detectLanguage,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await handler({
+    type: 'notify',
+    messages: [incoming('photo-caption', { imageMessage: { caption: 'photo' } })],
+  });
+  await handler({
+    type: 'notify',
+    messages: [incoming('clear-english', { conversation: 'Are you available now' })],
+  });
+
+  assert.deepEqual(deliveredLanguages, [['es', 'step1'], ['en', 'step2']]);
+});
+
+test('un LID sin PN no se usa como supuesto código telefónico', async () => {
+  let routed;
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => {},
+    routeInteraction: details => {
+      routed = details;
+      return { duplicate: false, responseKey: 'step1', language: 'es', contactKey: 'opaque' };
+    },
+    getResponseMessage: () => ({ text: '', audio: '' }),
+    readAudio: async () => null,
+    detectLanguage: () => null,
+    resolvePnForLid: async () => null,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await handler({
+    type: 'notify',
+    messages: [incoming('lid-only', { imageMessage: {} }, { remoteJid: '12345@lid' })],
+  });
+  assert.equal(routed.provisionalLanguage, null);
 });
 
 test('envia OGG/Opus como nota de voz cuando el lector lo proporciona', async (t) => {
@@ -195,9 +268,173 @@ test('un padre de álbum y sus hijos cuentan como una sola interacción', async 
 
   const results = await handler({ type: 'notify', messages: [parent, child] });
 
-  assert.equal(results[0].response, 'step1');
-  assert.equal(results[1].reason, 'duplicate');
+  assert.equal(results[0].reason, 'duplicate');
+  assert.equal(results[1].response, 'step1');
   assert.equal(effects.length, 2);
+});
+
+test('caption de hijo de álbum prevalece sobre el padre vacío sin duplicar respuesta', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-captioned-album-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const deliveredLanguages = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => {},
+    routeInteraction: details => state.register(details),
+    getResponseMessage: (language, key) => {
+      deliveredLanguages.push([language, key]);
+      return { text: key, audio: '' };
+    },
+    readAudio: async () => null,
+    detectLanguage,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const parent = incoming('captioned-album', { albumMessage: { expectedImageCount: 1 } });
+  const child = incoming('captioned-child', {
+    imageMessage: { caption: 'Are you available now' },
+    messageContextInfo: {
+      messageAssociation: { parentMessageKey: { id: 'captioned-album' } },
+    },
+  });
+
+  const results = await handler({ type: 'notify', messages: [parent, child] });
+
+  assert.equal(results[0].reason, 'duplicate');
+  assert.equal(results[1].response, 'step1');
+  assert.deepEqual(deliveredLanguages, [['en', 'step1']]);
+  const persisted = Object.values(state.contacts)[0];
+  assert.equal(persisted.language, 'en');
+  assert.equal(persisted.language_provisional, false);
+});
+
+test('álbumes de contactos distintos no colisionan aunque compartan parent id', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-cross-contact-album-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const deliveries = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async jid => deliveries.push(jid),
+    routeInteraction: details => state.register(details),
+    getResponseMessage: () => ({ text: 'respuesta', audio: '' }),
+    readAudio: async () => null,
+    detectLanguage,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const firstParent = incoming('same-parent', { albumMessage: { expectedImageCount: 1 } });
+  const firstChild = incoming('first-child', {
+    imageMessage: { caption: 'Are you available now' },
+    messageContextInfo: {
+      messageAssociation: { parentMessageKey: { id: 'same-parent' } },
+    },
+  });
+  const secondParent = incoming(
+    'same-parent',
+    { albumMessage: { expectedImageCount: 1 } },
+    { remoteJid: '447700900123@s.whatsapp.net' },
+  );
+  const secondChild = incoming('second-child', {
+    imageMessage: {},
+    messageContextInfo: {
+      messageAssociation: { parentMessageKey: { id: 'same-parent' } },
+    },
+  }, { remoteJid: '447700900123@s.whatsapp.net' });
+
+  const results = await handler({
+    type: 'notify',
+    messages: [firstParent, firstChild, secondParent, secondChild],
+  });
+
+  assert.equal(results[0].reason, 'duplicate');
+  assert.equal(results[1].response, 'step1');
+  assert.equal(results[2].reason, 'duplicate');
+  assert.equal(results[3].response, 'step1');
+  assert.equal(deliveries.length, 2);
+  assert.equal(Object.keys(state.contacts).length, 2);
+});
+
+test('padre LID y child PN/LID comparten álbum y el caption inglés prevalece', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-lid-pn-album-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const deliveredLanguages = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => {},
+    routeInteraction: details => state.register(details),
+    getResponseMessage: (language, key) => {
+      deliveredLanguages.push([language, key]);
+      return { text: key, audio: '' };
+    },
+    readAudio: async () => null,
+    detectLanguage,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const parent = incoming(
+    'lid-pn-parent',
+    { albumMessage: { expectedImageCount: 1 } },
+    { remoteJid: '12345@lid' },
+  );
+  const child = incoming('lid-pn-child', {
+    imageMessage: { caption: 'Are you available now' },
+    messageContextInfo: {
+      messageAssociation: { parentMessageKey: { id: 'lid-pn-parent' } },
+    },
+  }, {
+    remoteJid: '573001234567@s.whatsapp.net',
+    remoteJidAlt: '12345@lid',
+  });
+
+  const results = await handler({ type: 'notify', messages: [parent, child] });
+
+  assert.equal(results[0].reason, 'duplicate');
+  assert.equal(results[1].response, 'step1');
+  assert.deepEqual(deliveredLanguages, [['en', 'step1']]);
+  const persisted = Object.values(state.contacts)[0];
+  assert.equal(persisted.language, 'en');
+  assert.equal(persisted.language_provisional, false);
+});
+
+test('solapamientos transitivos LID→PN eligen un solo representante con caption', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-transitive-album-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const deliveries = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => deliveries.push('sent'),
+    routeInteraction: details => state.register(details),
+    getResponseMessage: () => ({ text: 'respuesta', audio: '' }),
+    readAudio: async () => null,
+    detectLanguage,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const parent = incoming(
+    'transitive-parent',
+    { albumMessage: { expectedImageCount: 2 } },
+    { remoteJid: '67890@lid' },
+  );
+  const bridge = incoming('transitive-bridge', {
+    imageMessage: {},
+    messageContextInfo: {
+      messageAssociation: { parentMessageKey: { id: 'transitive-parent' } },
+    },
+  }, {
+    remoteJid: '573009876543@s.whatsapp.net',
+    remoteJidAlt: '67890@lid',
+  });
+  const captioned = incoming('transitive-caption', {
+    imageMessage: { caption: 'Are you available now' },
+    messageContextInfo: {
+      messageAssociation: { parentMessageKey: { id: 'transitive-parent' } },
+    },
+  }, { remoteJid: '573009876543@s.whatsapp.net' });
+
+  const results = await handler({
+    type: 'notify',
+    messages: [parent, bridge, captioned],
+  });
+
+  assert.deepEqual(results.map(result => result.reason || result.response), [
+    'duplicate',
+    'duplicate',
+    'step1',
+  ]);
+  assert.equal(deliveries.length, 1);
+  assert.equal(Object.values(state.contacts)[0].language, 'en');
 });
 
 test('un hijo de álbum envuelto conserva el id del padre', async () => {
@@ -216,9 +453,45 @@ test('un hijo de álbum envuelto conserva el id del padre', async () => {
 
   const results = await handler({ type: 'notify', messages: [parent, child] });
 
-  assert.equal(results[0].response, 'step1');
-  assert.equal(results[1].reason, 'duplicate');
+  assert.equal(results[0].reason, 'duplicate');
+  assert.equal(results[1].response, 'step1');
   assert.equal(effects.length, 2);
+});
+
+test('parent vacío en callback previo no consume el caption de un callback posterior', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-split-album-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const deliveredLanguages = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => {},
+    routeInteraction: details => state.register(details),
+    getResponseMessage: (language, key) => {
+      deliveredLanguages.push([language, key]);
+      return { text: key, audio: '' };
+    },
+    readAudio: async () => null,
+    detectLanguage,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const parent = incoming('split-parent', { albumMessage: { expectedImageCount: 1 } });
+  const child = incoming('split-child', {
+    imageMessage: { caption: 'Are you available now' },
+    messageContextInfo: {
+      messageAssociation: { parentMessageKey: { id: 'split-parent' } },
+    },
+  });
+
+  const first = await handler({ type: 'notify', messages: [parent] });
+  assert.equal(first[0].reason, 'album_placeholder');
+  assert.deepEqual(deliveredLanguages, []);
+  assert.equal(Object.keys(state.contacts).length, 0);
+
+  const second = await handler({ type: 'notify', messages: [child] });
+  assert.equal(second[0].response, 'step1');
+  assert.deepEqual(deliveredLanguages, [['en', 'step1']]);
+  const persisted = Object.values(state.contacts)[0];
+  assert.equal(persisted.language, 'en');
+  assert.equal(persisted.language_provisional, false);
 });
 
 test('la resolución LID lenta no invierte Paso 1 y Paso 2', async () => {
@@ -331,4 +604,63 @@ test('un envío sin respuesta vence y no bloquea al contacto para siempre', asyn
   assert.equal(firstResult[0].text, 'failed');
   assert.equal(secondResult[0].text, 'sent');
   assert.equal(secondResult[0].response, 'step2');
+});
+
+test('marca la conversación como leída antes de iniciar la respuesta', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-message-read-order-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const effects = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => effects.push('send'),
+    markRead: async key => effects.push(`read:${key.id}`),
+    routeInteraction: details => state.register(details),
+    getResponseMessage: () => ({ text: 'respuesta', audio: '' }),
+    readAudio: async () => null,
+    detectLanguage: () => 'es',
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await handler({ type: 'notify', messages: [incoming('read-first', { conversation: 'hola' })] });
+
+  assert.deepEqual(effects, ['read:read-first', 'send']);
+});
+
+test('una pausa previa no consume el evento ni avanza la fase de conversación', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-message-paused-state-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  let routed = 0;
+  const common = {
+    routeInteraction: details => {
+      routed += 1;
+      return state.register(details);
+    },
+    getResponseMessage: (_language, key) => ({ text: key, audio: '' }),
+    readAudio: async () => null,
+    detectLanguage: () => 'es',
+    logger: { info() {}, warn() {}, error() {} },
+  };
+  const paused = createWhatsAppMessageHandler({
+    ...common,
+    deliveryAllowed: () => false,
+    sendMessage: async () => assert.fail('delivery must remain blocked'),
+  });
+
+  const ignored = await paused({
+    type: 'notify',
+    messages: [incoming('paused-event', { conversation: 'hola' })],
+  });
+  assert.equal(ignored[0].reason, 'delivery_blocked');
+  assert.equal(routed, 0);
+
+  const effects = [];
+  const resumed = createWhatsAppMessageHandler({
+    ...common,
+    sendMessage: async (_jid, content) => effects.push(content.text),
+  });
+  const delivered = await resumed({
+    type: 'notify',
+    messages: [incoming('resumed-event', { conversation: 'hola' })],
+  });
+  assert.equal(delivered[0].response, 'step1');
+  assert.deepEqual(effects, ['step1']);
 });

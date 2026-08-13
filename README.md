@@ -49,20 +49,47 @@ El panel incluye un modo de prueba reversible para repetir el flujo completo con
 el mismo celular:
 
 1. Vincula y confirma los canales desde el navegador administrador.
-2. Envía una interacción desde el celular de prueba para que sea la conversación
-   más reciente del canal.
+2. Para Telegram, o si quieres usar el atajo de actividad reciente, envía una
+   interacción desde el celular de prueba para que sea la conversación más reciente.
 3. Activa **Modo de prueba de conversaciones** en el panel.
 4. Elige detección automática, español, inglés o francés. Seleccionar un idioma
    permite probar una llamada como primera interacción, aunque no contenga texto.
-5. Reinicia la conversación más reciente de Telegram, WhatsApp o ambas.
+5. Reinicia la conversación más reciente de Telegram, WhatsApp o ambas. En
+   WhatsApp también puedes indicar directamente el número internacional del
+   celular cliente, incluso antes de su primera interacción.
 6. La siguiente interacción de ese celular empezará nuevamente en **Paso 1** y
    usará el idioma seleccionado o lo detectará desde el próximo texto.
 
-El reinicio no desvincula cuentas ni elimina credenciales. Antes de cambiar el
-estado, conserva una copia en `/app/data/test_mode_backups`. Como el sistema no
-guarda números de clientes en claro, esta herramienta identifica la conversación
-por su actividad más reciente; no debe usarse mientras haya tráfico real de otros
+El reinicio no desvincula cuentas ni elimina credenciales. Antes de cambiar un
+archivo existente, conserva una copia en `/app/data/test_mode_backups`. El número
+específico sólo se normaliza en memoria para calcular los mismos identificadores
+hash que usa WhatsApp: nunca se escribe en texto legible ni se devuelve al
+navegador. El atajo de
+"conversación más reciente" no debe usarse mientras haya tráfico real de otros
 clientes.
+
+### Salud operativa de WhatsApp
+
+Las respuestas de WhatsApp aplican pausas acotadas de lectura y preparación,
+presencia `composing`/`recording`, límites globales de frecuencia, backoff y un
+circuit breaker. El panel muestra un indicador de riesgo operativo sin guardar
+teléfonos, JID, mensajes ni errores sin filtrar. Un `403` pausa los envíos hasta
+que un administrador confirme explícitamente la revisión; un `429` activa un
+enfriamiento temporal. Estas medidas reducen ráfagas y ayudan a responder ante
+fallos, pero no garantizan ni prometen influir en decisiones de Meta.
+
+Los valores predeterminados son conservadores y pueden ajustarse mediante:
+`WA_PRESENCE_ENABLED`, `WA_READ_RECEIPTS_ENABLED`, `WA_READ_DELAY_MIN_MS`,
+`WA_READ_DELAY_MAX_MS`, `WA_TEXT_DELAY_MIN_MS`, `WA_TEXT_DELAY_MAX_MS`,
+`WA_TEXT_MS_PER_CHAR`, `WA_AUDIO_DELAY_MIN_MS`, `WA_AUDIO_DELAY_MAX_MS`,
+`WA_UX_JITTER_RATIO`, `WA_MIN_SEND_INTERVAL_MS`,
+`WA_MAX_SENDS_PER_MINUTE`, `WA_MAX_PENDING_SENDS`,
+`WA_QUEUE_WAIT_TIMEOUT_MS`, `WA_AUXILIARY_TIMEOUT_MS`,
+`WA_BACKOFF_BASE_MS`, `WA_BACKOFF_MAX_MS`,
+`WA_CIRCUIT_FAILURE_THRESHOLD`, `WA_CIRCUIT_FAILURE_WINDOW_MS`,
+`WA_CIRCUIT_OPEN_MS`, `WA_FORBIDDEN_CIRCUIT_OPEN_MS`,
+`WA_SAFE_SEND_TIMEOUT_MS`, `WA_RECONNECT_BASE_MS`, `WA_RECONNECT_MAX_MS` y
+`WA_RECONNECT_STABLE_MS`.
 
 ---
 

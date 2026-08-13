@@ -5,6 +5,7 @@ import {
 } from '@whiskeysockets/baileys';
 import { settleWithTimeout } from './keyed_serial_queue.mjs';
 import { toWhatsAppAudioContent } from './wa_audio_delivery.mjs';
+import { provisionalLanguageFromWhatsAppIdentity } from './whatsapp_language_hint.mjs';
 
 const DEFAULT_CONTACT_RESOLUTION_TIMEOUT_MS = 5_000;
 const DEFAULT_SEND_TIMEOUT_MS = 20_000;
@@ -130,6 +131,8 @@ export function createWhatsAppMessageHandler({
   getResponseMessage,
   readAudio,
   detectLanguage,
+  markRead = async () => {},
+  deliveryAllowed = () => true,
   resolvePnForLid = async () => null,
   serializeClaim = async operation => operation(),
   serializeInteraction = async (_contactId, operation) => operation(),
@@ -144,6 +147,10 @@ export function createWhatsAppMessageHandler({
   if (typeof getResponseMessage !== 'function') throw new TypeError('getResponseMessage is required');
   if (typeof readAudio !== 'function') throw new TypeError('readAudio is required');
   if (typeof detectLanguage !== 'function') throw new TypeError('detectLanguage is required');
+  if (typeof markRead !== 'function') throw new TypeError('markRead must be a function');
+  if (typeof deliveryAllowed !== 'function') {
+    throw new TypeError('deliveryAllowed must be a function');
+  }
   if (typeof serializeClaim !== 'function') {
     throw new TypeError('serializeClaim must be a function');
   }
@@ -161,7 +168,7 @@ export function createWhatsAppMessageHandler({
     throw new TypeError('sendTimeoutMs must be positive');
   }
 
-  async function deliverResponse({ jid, decision }) {
+  async function deliverResponse({ jid, decision, messageKey }) {
     const response = getResponseMessage(decision.language, decision.responseKey) || {};
     const result = {
       status: 'handled',
@@ -169,6 +176,13 @@ export function createWhatsAppMessageHandler({
       text: 'skipped',
       audio: 'skipped',
     };
+
+    try {
+      await markRead(messageKey);
+    } catch {
+      // Read receipts are best effort and must not prevent a valid response.
+      logger.warn?.('[WA] Read receipt failed');
+    }
 
     const text = typeof response.text === 'string' ? response.text.trim() : '';
     if (text) {
@@ -224,6 +238,9 @@ export function createWhatsAppMessageHandler({
     if (!interaction) {
       return { status: 'ignored', reason: 'non_interaction' };
     }
+    if (interaction.contentType === 'albumMessage' && !interaction.text) {
+      return { status: 'ignored', reason: 'album_placeholder' };
+    }
 
     const eventId = interactionEventId(msg, interaction.contentType);
     if (!eventId) {
@@ -246,17 +263,29 @@ export function createWhatsAppMessageHandler({
           jid = await selectDirectMessageTarget(msg, async () => null);
         }
         if (!jid) return { ignored: { status: 'ignored', reason: 'non_direct' } };
+        try {
+          if (!await deliveryAllowed()) {
+            return { ignored: { status: 'ignored', reason: 'delivery_blocked' } };
+          }
+        } catch {
+          return { ignored: { status: 'ignored', reason: 'delivery_blocked' } };
+        }
 
+        const contactAliases = [
+          normalizeJid(msg?.key?.remoteJid || ''),
+          normalizeJid(msg?.key?.remoteJidAlt || ''),
+          jid,
+        ].filter(Boolean);
+        const detectedLanguage = interaction.text ? detectLanguage(interaction.text) : null;
         const decision = await routeInteraction({
           contactId: jid,
-          contactAliases: [
-            normalizeJid(msg?.key?.remoteJid || ''),
-            normalizeJid(msg?.key?.remoteJidAlt || ''),
-            jid,
-          ].filter(Boolean),
+          contactAliases,
           eventId,
           kind: 'content',
-          detectedLanguage: interaction.text ? detectLanguage(interaction.text) : null,
+          detectedLanguage,
+          provisionalLanguage: detectedLanguage
+            ? null
+            : provisionalLanguageFromWhatsAppIdentity(jid, contactAliases),
         });
         return { jid, decision };
       });
@@ -272,12 +301,93 @@ export function createWhatsAppMessageHandler({
 
     return serializeInteraction(
       claimed.decision.contactKey || claimed.jid,
-      () => deliverResponse({ jid: claimed.jid, decision: claimed.decision }),
+      () => deliverResponse({
+        jid: claimed.jid,
+        decision: claimed.decision,
+        messageKey: msg?.key,
+      }),
     );
   }
 
   return async function handleMessageBatch({ messages = [], type } = {}) {
     if (!['notify', 'append'].includes(type) || !Array.isArray(messages)) return [];
-    return Promise.all(messages.map(msg => processOne(msg, type)));
+    // Baileys may deliver an empty album parent before a child carrying the
+    // only useful caption. Both intentionally share one event id. Select the
+    // text-bearing representative first so the empty parent cannot lock a
+    // provisional language and make the caption look like a persisted retry.
+    // Scope grouping by connected identity sets: during PN/LID convergence the
+    // parent may carry only the LID while the child carries both PN and LID.
+    // Provider event ids are not globally unique, so disjoint contacts with
+    // the same parent id must remain independent.
+    const batchEvents = messages.map(msg => {
+      const interaction = describeInteraction(msg?.message);
+      if (!interaction) return null;
+      const eventId = interactionEventId(msg, interaction.contentType);
+      const identities = [...new Set([
+        normalizeJid(msg?.key?.remoteJid || ''),
+        normalizeJid(msg?.key?.remoteJidAlt || ''),
+      ].filter(Boolean))];
+      return {
+        eventId,
+        identities,
+        hasText: Boolean(interaction.text),
+        isPlaceholder: interaction.contentType === 'albumMessage' && !interaction.text,
+      };
+    });
+
+    const componentParents = batchEvents.map((_event, index) => index);
+    function findComponent(index) {
+      let root = index;
+      while (componentParents[root] !== root) root = componentParents[root];
+      while (componentParents[index] !== index) {
+        const next = componentParents[index];
+        componentParents[index] = root;
+        index = next;
+      }
+      return root;
+    }
+    function unionComponents(left, right) {
+      const leftRoot = findComponent(left);
+      const rightRoot = findComponent(right);
+      if (leftRoot !== rightRoot) componentParents[rightRoot] = leftRoot;
+    }
+    const indexesByEvent = new Map();
+    for (const [index, event] of batchEvents.entries()) {
+      if (!event?.eventId || event.identities.length === 0) continue;
+      const priorIndexes = indexesByEvent.get(event.eventId) || [];
+      for (const priorIndex of priorIndexes) {
+        const priorIdentities = batchEvents[priorIndex].identities;
+        if (event.identities.some(identity => priorIdentities.includes(identity))) {
+          unionComponents(index, priorIndex);
+        }
+      }
+      priorIndexes.push(index);
+      indexesByEvent.set(event.eventId, priorIndexes);
+    }
+
+    const preferredByComponent = new Map();
+    for (const [index, event] of batchEvents.entries()) {
+      if (!event?.eventId || event.identities.length === 0) continue;
+      const component = findComponent(index);
+      const current = preferredByComponent.get(component);
+      const priority = event.hasText ? 2 : (event.isPlaceholder ? 0 : 1);
+      if (!current || priority > current.priority) {
+        preferredByComponent.set(component, { index, priority });
+      }
+    }
+
+    return Promise.all(messages.map((msg, index) => {
+      const event = batchEvents[index];
+      const component = event?.eventId && event.identities.length > 0
+        ? findComponent(index)
+        : null;
+      if (
+        component !== null
+        && preferredByComponent.get(component)?.index !== index
+      ) {
+        return { status: 'ignored', reason: 'duplicate' };
+      }
+      return processOne(msg, type);
+    }));
   };
 }

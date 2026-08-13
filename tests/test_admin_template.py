@@ -60,8 +60,31 @@ class AdminTemplateTestCase(unittest.TestCase):
         self.assertIn("resetTestConversation('whatsapp')", template)
         self.assertIn("resetTestConversation('both')", template)
         self.assertIn('id="test-mode-language"', template)
+        self.assertIn('id="test-mode-whatsapp-number"', template)
+        self.assertIn('autocomplete="off"', template)
+        self.assertIn("resetSpecificWhatsAppConversation()", template)
+        self.assertIn('return resetTestConversation("whatsapp", "number")', template)
+        self.assertIn('payload.target = "number"', template)
+        self.assertIn("payload.whatsapp_number = whatsappNumber", template)
+        self.assertIn('if (target === "number") phoneInput.value = ""', template)
         self.assertIn("headers: channelHeaders()", template)
-        self.assertIn("body: JSON.stringify({channel, language, confirm: true})", template)
+        self.assertIn("body: JSON.stringify(payload)", template)
+        self.assertNotIn("localStorage", template)
+        self.assertNotIn("conversation_count", template)
+        self.assertNotIn("Conversaciones guardadas:", template)
+
+    def test_whatsapp_operational_risk_ui_is_actionable_without_account_evasion(self):
+        template = app_module.TEMPLATE
+        self.assertIn('id="wa-safety-status"', template)
+        self.assertIn('id="wa-safety-alert"', template)
+        self.assertIn('fetch("/api/wa_safety_health"', template)
+        self.assertIn('fetch("/api/wa_safety/pause"', template)
+        self.assertIn("setWaOutboundPaused(true)", template)
+        self.assertIn("setWaOutboundPaused(false)", template)
+        self.assertIn("headers: channelHeaders()", template)
+        self.assertIn("review_confirmed: paused ? false : true", template)
+        self.assertIn("Reanudar bajo revisión", template)
+        self.assertNotIn("Cambiar Número Ahora", template)
 
     def test_whatsapp_cancel_invalidates_poll_and_cannot_race_commit(self):
         template = app_module.TEMPLATE

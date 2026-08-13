@@ -26,7 +26,9 @@ from telegram_audio_branding import (
 from test_mode import (
     interaction_state_summary,
     load_test_mode,
+    normalize_whatsapp_phone,
     reset_latest_interaction,
+    reset_whatsapp_interaction_by_number,
     save_test_mode,
 )
 
@@ -38,6 +40,9 @@ DEFAULT_MESSAGES_FILE = BASE_DIR / "messages.json"
 TG_AUDIO_BRANDING_DEFAULTS_FILE = BASE_DIR / "telegram_audio_branding.defaults.json"
 TG_AUDIO_BRANDING_SETTINGS_FILE = DATA_DIR / "telegram_audio_branding.json"
 WA_CALL_HEALTH_FILE = DATA_DIR / "wa_call_health.json"
+WA_SAFETY_HEALTH_FILE = DATA_DIR / "wa_safety_health.json"
+WA_SAFETY_CONTROL_FILE = DATA_DIR / "wa_safety_control.json"
+WA_SAFETY_STALE_AFTER_MS = 90_000
 TG_SESSION_BASE = DATA_DIR / "tg_session"
 TG_SWITCH_SESSION_BASE = DATA_DIR / "tg_switch_session"
 TG_SWITCH_ROLLBACK_DIR = DATA_DIR / ".tg_switch_rollback"
@@ -98,6 +103,7 @@ _telegram_switch_lock = threading.RLock()
 _wa_process_lock = threading.RLock()
 _wa_switch_lock = threading.RLock()
 _test_mode_lock = threading.RLock()
+_wa_safety_lock = threading.RLock()
 _wa_switch_expiry_timer: threading.Timer | None = None
 
 # ── HTML Template (todo en uno para portabilidad) ───────────────────
@@ -159,10 +165,29 @@ label { color: #c8c8e0 !important; font-weight: 500; }
         <span id="bot-status" class="badge bg-secondary" style="font-size:0.75rem;">📱 TG User: Verificando...</span>
         <span id="bf-status" class="badge bg-secondary" style="font-size:0.75rem;">🤖 BotFather: Verificando...</span>
         <span id="wa-status" class="badge bg-secondary" style="font-size:0.75rem;">💬 WA: Verificando...</span>
+        <span id="wa-safety-status" class="badge bg-secondary" style="font-size:0.75rem;">🛡️ Riesgo operativo WA: Verificando...</span>
       </div>
       <button class="btn btn-sm btn-outline-light" onclick="showSetup()">⚙️ Configurar</button>
       <button class="btn btn-sm btn-outline-light" onclick="restartBot()">🔄 Reiniciar servicio TG</button>
       <button id="restart-wa-btn" class="btn btn-sm btn-outline-light" onclick="restartWaBot()">🔄 Reiniciar servicio WA</button>
+    </div>
+  </div>
+
+  <div id="wa-safety-alert" class="alert alert-danger mb-4" role="alert" style="display:none;">
+    <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
+      <div>
+        <strong id="wa-safety-alert-title">⚠️ Atención operativa de WhatsApp</strong>
+        <div id="wa-safety-alert-text" class="small mt-1"></div>
+        <div class="small mt-1">
+          Revisa el estado oficial de WhatsApp y sus políticas antes de reanudar; este panel no puede garantizar decisiones de Meta.
+        </div>
+      </div>
+      <div class="d-flex flex-wrap gap-2">
+        <button id="wa-safety-pause-btn" class="btn btn-sm btn-danger" onclick="setWaOutboundPaused(true)">⏸ Pausar envíos</button>
+        <button id="wa-safety-resume-btn" class="btn btn-sm btn-outline-light" onclick="setWaOutboundPaused(false)" style="display:none;">▶ Reanudar bajo revisión</button>
+        <a class="btn btn-sm btn-outline-light" href="https://metastatus.com/whatsapp-business-api" target="_blank" rel="noopener noreferrer">Estado oficial</a>
+        <a class="btn btn-sm btn-outline-light" href="https://business.whatsapp.com/policy" target="_blank" rel="noopener noreferrer">Políticas</a>
+      </div>
     </div>
   </div>
 
@@ -331,8 +356,8 @@ label { color: #c8c8e0 !important; font-weight: 500; }
     <div class="card-body">
       <p class="small text-muted mb-2">
         Permite que el mismo celular vuelva a recibir Paso 1 y pruebe otro idioma o escenario.
-        Por privacidad, el panel no guarda el número: reinicia la conversación más reciente de
-        cada canal, sin desvincular Telegram ni WhatsApp.
+        Puedes reiniciar la conversación más reciente o preparar un número de WhatsApp específico,
+        sin desvincular ningún canal. El número no se guarda en texto legible ni se devuelve.
       </p>
       <p id="test-mode-summary" class="small mb-3">Cargando estado…</p>
       <div class="d-flex align-items-center gap-2 mb-3">
@@ -343,6 +368,23 @@ label { color: #c8c8e0 !important; font-weight: 500; }
           <option value="en">English</option>
           <option value="fr">Français</option>
         </select>
+      </div>
+      <div class="mb-3">
+        <label for="test-mode-whatsapp-number" class="form-label small mb-1">
+          Número cliente para una prueba de WhatsApp
+        </label>
+        <div class="d-flex flex-wrap gap-2">
+          <input id="test-mode-whatsapp-number" type="tel" inputmode="tel" autocomplete="off"
+                 spellcheck="false" maxlength="32" class="form-control form-control-sm test-reset-input"
+                 style="max-width:260px;" placeholder="Ej. +573001234567" disabled>
+          <button class="btn btn-sm btn-primary test-reset-button"
+                  onclick="resetSpecificWhatsAppConversation()" disabled>
+            Preparar este número en WhatsApp
+          </button>
+        </div>
+        <div class="form-text">
+          Incluye el código de país. El valor sólo se usa para localizar o preparar su estado protegido.
+        </div>
       </div>
       <div class="d-flex flex-wrap gap-2">
         <button id="test-mode-toggle" class="btn btn-sm btn-outline-light" onclick="toggleTestMode()" disabled>
@@ -885,6 +927,104 @@ async function updateWaStatus(running) {
     el.className = "badge bg-secondary";
     el.innerHTML = '💬 WA: Incierto';
     if (!waSwitchPolling) qrCard.style.display = 'none';
+  }
+}
+
+let waSafetyRequest = null;
+
+function renderWaSafety(data) {
+  const badge = document.getElementById("wa-safety-status");
+  const alert = document.getElementById("wa-safety-alert");
+  const title = document.getElementById("wa-safety-alert-title");
+  const text = document.getElementById("wa-safety-alert-text");
+  const pauseButton = document.getElementById("wa-safety-pause-btn");
+  const resumeButton = document.getElementById("wa-safety-resume-btn");
+  const level = data && data.available ? data.level : "unknown";
+  const paused = Boolean(data && data.operator_paused);
+  const labels = {
+    low: "Bajo",
+    moderate: "Moderado",
+    high: "Alto",
+    unknown: "Sin datos",
+  };
+  const classes = {
+    low: "badge bg-success",
+    moderate: "badge bg-warning text-dark",
+    high: "badge bg-danger",
+    unknown: "badge bg-secondary",
+  };
+  badge.className = classes[level] || classes.unknown;
+  badge.textContent = `🛡️ Riesgo operativo WA: ${labels[level] || labels.unknown}${paused ? " · Envíos pausados" : ""}`;
+
+  const showAlert = level === "high" || paused;
+  alert.style.display = showAlert ? "block" : "none";
+  if (!showAlert) return;
+  pauseButton.style.display = paused ? "none" : "inline-block";
+  resumeButton.style.display = paused ? "inline-block" : "none";
+  if (paused) {
+    title.textContent = "⏸ Envíos de WhatsApp pausados";
+    text.textContent = level === "high"
+      ? "La protección detuvo las respuestas. Revisa la cuenta y la causa indicada por el proveedor antes de decidir si reanudar."
+      : "La pausa administrativa está activa. Las conversaciones se conservan y no se enviarán nuevas respuestas.";
+  } else {
+    title.textContent = "⚠️ Riesgo operativo alto en WhatsApp";
+    text.textContent = "Se detectaron restricciones, fallos repetidos o reconexiones inusuales. Pausa los envíos y revisa la cuenta antes de continuar.";
+  }
+}
+
+async function loadWaSafetyHealth(force=false) {
+  if (waSafetyRequest && force) await waSafetyRequest;
+  if (waSafetyRequest) return waSafetyRequest;
+  waSafetyRequest = (async () => {
+    try {
+      const response = await fetch("/api/wa_safety_health", {cache: "no-store"});
+      const data = await response.json();
+      if (response.ok) renderWaSafety(data);
+      return data;
+    } catch {
+      renderWaSafety({available: false, level: "unknown", operator_paused: false});
+      return null;
+    } finally {
+      waSafetyRequest = null;
+    }
+  })();
+  return waSafetyRequest;
+}
+
+async function setWaOutboundPaused(paused) {
+  const channels = await loadChannelState();
+  if (!channels || !channels.can_manage) {
+    guideChannelAdminRecovery();
+    toast("🔐 Recupera primero el acceso administrativo.", "error");
+    return;
+  }
+  const question = paused
+    ? "¿Pausar ahora todas las respuestas salientes de WhatsApp?"
+    : "¿Confirmas que revisaste el estado y las políticas aplicables antes de reanudar?";
+  if (!confirm(question)) return;
+  try {
+    const response = await fetch("/api/wa_safety/pause", {
+      method: "POST",
+      headers: channelHeaders(),
+      body: JSON.stringify({
+        paused,
+        confirm: true,
+        review_confirmed: paused ? false : true,
+      }),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || "No se pudo actualizar la pausa.");
+    toast(
+      paused
+        ? "⏸ Envíos de WhatsApp pausados."
+        : (data.delivery_blocked
+          ? "✅ Revisión confirmada; el enfriamiento automático sigue activo."
+          : "▶ Envíos de WhatsApp reanudados bajo revisión."),
+      "success",
+    );
+    await loadWaSafetyHealth(true);
+  } catch (error) {
+    toast("❌ " + error.message, "error");
   }
 }
 
@@ -1634,11 +1774,12 @@ function renderTestModeState(data) {
   document.querySelectorAll(".test-reset-button").forEach(button => {
     button.disabled = !canManage || !enabled;
   });
-  const tgCount = data?.telegram?.conversation_count ?? 0;
-  const waCount = data?.whatsapp?.conversation_count ?? 0;
+  document.querySelectorAll(".test-reset-input").forEach(input => {
+    input.disabled = !canManage || !enabled;
+  });
   summary.textContent = canManage
-    ? `Conversaciones guardadas: Telegram ${tgCount} · WhatsApp ${waCount}. ` +
-      "El botón reinicia únicamente la más reciente y conserva un respaldo del estado anterior."
+    ? "Puedes reiniciar la conversación más reciente o preparar un número específico de WhatsApp. " +
+      "Cuando exista un estado anterior, se conservará un respaldo."
     : "Confirma primero una cuenta vinculada para administrar el modo de prueba.";
 }
 
@@ -1677,23 +1818,42 @@ async function toggleTestMode() {
   }
 }
 
-async function resetTestConversation(channel) {
+function resetSpecificWhatsAppConversation() {
+  return resetTestConversation("whatsapp", "number");
+}
+
+async function resetTestConversation(channel, target="latest") {
   const channelLabel = channel === "both" ? "Telegram y WhatsApp" :
     channel === "telegram" ? "Telegram" : "WhatsApp";
   const language = document.getElementById("test-mode-language").value;
   const languageLabel = language === "auto" ? "detección automática" : language.toUpperCase();
+  const phoneInput = document.getElementById("test-mode-whatsapp-number");
+  const whatsappNumber = target === "number" ? phoneInput.value.trim() : "";
+  if (target === "number" && !whatsappNumber) {
+    toast("Escribe el número internacional de prueba.", "error");
+    phoneInput.focus();
+    return;
+  }
+  const targetLabel = target === "number"
+    ? "el número indicado de WhatsApp"
+    : `la conversación más reciente de ${channelLabel}`;
   if (!confirm(
-    `Se reiniciará la conversación más reciente de ${channelLabel}. ` +
-    `La próxima interacción recibirá Paso 1 con ${languageLabel}. ¿Continuar?`
+    `Se reiniciará ${targetLabel}. ` +
+    `El próximo mensaje recibirá Paso 1 con ${languageLabel}. ¿Continuar?`
   )) return;
   document.querySelectorAll(".test-reset-button").forEach(button => button.disabled = true);
   const status = document.getElementById("test-mode-status");
   status.textContent = "Reiniciando estado y recargando los servicios activos…";
   try {
+    const payload = {channel, language, confirm: true};
+    if (target === "number") {
+      payload.target = "number";
+      payload.whatsapp_number = whatsappNumber;
+    }
     const response = await fetch("/api/test_mode/reset", {
       method: "POST",
       headers: channelHeaders(),
-      body: JSON.stringify({channel, language, confirm: true}),
+      body: JSON.stringify(payload),
     });
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.error || "No fue posible reiniciar la conversación");
@@ -1703,6 +1863,7 @@ async function resetTestConversation(channel) {
     status.textContent = resetChannels.length
       ? `Listo: ${resetChannels.join(" y ")} comenzará desde Paso 1.`
       : "No había conversaciones guardadas para reiniciar.";
+    if (target === "number") phoneInput.value = "";
     toast(status.textContent, "success");
     await Promise.all([loadTestMode(), loadData()]);
   } catch (error) {
@@ -1716,10 +1877,15 @@ async function resetTestConversation(channel) {
 loadData();
 loadChannelState();
 loadTestMode();
+loadWaSafetyHealth();
 setInterval(loadData, 10000);
 setInterval(loadChannelState, 10000);
+setInterval(loadWaSafetyHealth, 10000);
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") loadChannelState();
+  if (document.visibilityState === "visible") {
+    loadChannelState();
+    loadWaSafetyHealth();
+  }
 });
 // Auto-iniciar BotFather si hay token configurado
 fetch("/api/start_botfather", {method:"POST"}).catch(()=>{});
@@ -2475,7 +2641,7 @@ def _read_wa_call_health(file_path: Path = WA_CALL_HEALTH_FILE):
         ),
         "reason": _safe_enum(
             pipeline.get("reason"),
-            {"completed", "non_offer", "invalid_event", "missing_identity", "group_call", "duplicate", "unexpected_error", "never"},
+            {"completed", "non_offer", "invalid_event", "missing_identity", "group_call", "duplicate", "delivery_blocked", "unexpected_error", "never"},
             "unexpected_error",
         ),
         "offline": pipeline.get("offline") if isinstance(pipeline.get("offline"), bool) else None,
@@ -2496,6 +2662,237 @@ def _read_wa_call_health(file_path: Path = WA_CALL_HEALTH_FILE):
         ),
     }
     return result
+
+
+_WA_SAFETY_EVENT_TYPES = {
+    "outgoing",
+    "delivery_failure",
+    "rate_limited",
+    "forbidden",
+    "local_rate_limit",
+    "reconnect",
+}
+_WA_SAFETY_REASON_TYPES = {
+    "forbidden_response",
+    "rate_limited_response",
+    "delivery_failures",
+    "frequent_reconnects",
+    "circuit_open",
+    "elevated_activity",
+    "local_rate_limit",
+    "backoff_active",
+    "operator_paused",
+}
+
+
+def _read_wa_safety_health(
+    file_path: Path = WA_SAFETY_HEALTH_FILE,
+    control_file_path: Path | None = None,
+) -> dict:
+    """Return an allowlisted operational snapshot without message/account data."""
+
+    result = {
+        "available": False,
+        "updated_at": None,
+        "level": "unknown",
+        "reasons": [],
+        "counts": {
+            "outgoing_1m": 0,
+            "delivery_failures_15m": 0,
+            "reconnects_15m": 0,
+            "rate_limits_60m": 0,
+            "forbidden_60m": 0,
+            "local_rate_limits_15m": 0,
+        },
+        "operator_paused": False,
+        "backoff_until": None,
+        "circuit_open_until": None,
+        "delivery_blocked": False,
+    }
+    try:
+        raw = json.loads(file_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        raw = None
+    valid_health = isinstance(raw, dict) and raw.get("schema_version") == 1
+    if not valid_health:
+        raw = {}
+
+    now_ms = int(time.time() * 1000)
+    events = []
+    raw_events = raw.get("events") if isinstance(raw.get("events"), list) else []
+    for event in raw_events[-3000:]:
+        if not isinstance(event, dict) or event.get("type") not in _WA_SAFETY_EVENT_TYPES:
+            continue
+        at = event.get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            continue
+        at = int(at)
+        if now_ms - 60 * 60 * 1000 <= at <= now_ms + 60_000:
+            events.append((event["type"], at))
+
+    def count_since(event_type: str, window_ms: int) -> int:
+        floor = now_ms - window_ms
+        return sum(1 for name, at in events if name == event_type and at >= floor)
+
+    counts = {
+        "outgoing_1m": count_since("outgoing", 60_000),
+        "delivery_failures_15m": count_since("delivery_failure", 15 * 60_000),
+        "reconnects_15m": count_since("reconnect", 15 * 60_000),
+        "rate_limits_60m": count_since("rate_limited", 60 * 60_000),
+        "forbidden_60m": count_since("forbidden", 60 * 60_000),
+        "local_rate_limits_15m": count_since("local_rate_limit", 15 * 60_000),
+    }
+    backoff_until = raw.get("backoff_until")
+    if not isinstance(backoff_until, (int, float)) or isinstance(backoff_until, bool):
+        backoff_until = None
+    elif backoff_until <= now_ms:
+        backoff_until = None
+    else:
+        backoff_until = int(backoff_until)
+    circuit_open_until = raw.get("circuit_open_until")
+    if not isinstance(circuit_open_until, (int, float)) or isinstance(circuit_open_until, bool):
+        circuit_open_until = None
+    elif circuit_open_until <= now_ms:
+        circuit_open_until = None
+    else:
+        circuit_open_until = int(circuit_open_until)
+    operator_paused = raw.get("operator_paused") is True
+    control_path = control_file_path or file_path.with_name("wa_safety_control.json")
+    try:
+        control = json.loads(control_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        control = None
+    if isinstance(control, dict) and control.get("schema_version") == 1:
+        operator_paused = control.get("operator_paused") is True
+
+    reasons = []
+    if counts["forbidden_60m"]:
+        reasons.append("forbidden_response")
+    if counts["rate_limits_60m"]:
+        reasons.append("rate_limited_response")
+    if counts["delivery_failures_15m"] >= 5:
+        reasons.append("delivery_failures")
+    if counts["reconnects_15m"] >= 5:
+        reasons.append("frequent_reconnects")
+    if circuit_open_until:
+        reasons.append("circuit_open")
+    level = "high" if reasons else "low"
+    if level == "low":
+        if counts["delivery_failures_15m"] >= 2:
+            reasons.append("delivery_failures")
+        if counts["reconnects_15m"] >= 3:
+            reasons.append("frequent_reconnects")
+        if counts["outgoing_1m"] >= 15:
+            reasons.append("elevated_activity")
+        if counts["local_rate_limits_15m"]:
+            reasons.append("local_rate_limit")
+        if backoff_until:
+            reasons.append("backoff_active")
+        if operator_paused:
+            reasons.append("operator_paused")
+        if reasons:
+            level = "moderate"
+
+    updated_at = raw.get("updated_at")
+    if not isinstance(updated_at, (int, float)) or isinstance(updated_at, bool):
+        updated_at = None
+    result.update({
+        "available": valid_health,
+        "updated_at": int(updated_at) if updated_at is not None else None,
+        "level": level if valid_health else "unknown",
+        "reasons": [reason for reason in reasons if reason in _WA_SAFETY_REASON_TYPES][:9],
+        "counts": counts,
+        "operator_paused": operator_paused,
+        "backoff_until": backoff_until,
+        "circuit_open_until": circuit_open_until,
+        "delivery_blocked": bool(operator_paused or backoff_until or circuit_open_until),
+    })
+    return result
+
+
+def _set_wa_operator_pause(
+    paused: bool,
+    control_file_path: Path = WA_SAFETY_CONTROL_FILE,
+    health_file_path: Path = WA_SAFETY_HEALTH_FILE,
+) -> dict:
+    """Atomically change pause control without racing the worker telemetry file."""
+
+    now_ms = int(time.time() * 1000)
+    with _wa_safety_lock:
+        control = {
+            "schema_version": 1,
+            "operator_paused": paused,
+            "pause_updated_at": now_ms,
+        }
+        temporary = control_file_path.with_name(
+            f"{control_file_path.name}.{os.getpid()}.tmp"
+        )
+        control_file_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            temporary.write_text(json.dumps(control, indent=2) + "\n", encoding="utf-8")
+            try:
+                os.chmod(temporary, 0o600)
+            except OSError:
+                pass
+            os.replace(temporary, control_file_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return _read_wa_safety_health(health_file_path, control_file_path)
+
+
+@app.route("/api/wa_safety_health")
+def api_wa_safety_health():
+    health = _read_wa_safety_health(WA_SAFETY_HEALTH_FILE, WA_SAFETY_CONTROL_FILE)
+    worker_running = _wa_process_running(DATA_DIR / "wa_bot.pid")
+    updated_at = health.get("updated_at")
+    now_ms = int(time.time() * 1000)
+    telemetry_fresh = bool(
+        isinstance(updated_at, int)
+        and -60_000 <= now_ms - updated_at <= WA_SAFETY_STALE_AFTER_MS
+    )
+    health["worker_running"] = worker_running
+    health["telemetry_fresh"] = telemetry_fresh
+    if (
+        health.get("level") != "high"
+        and not health.get("operator_paused")
+        and not (worker_running and telemetry_fresh)
+    ):
+        health["available"] = False
+        health["level"] = "unknown"
+    response = jsonify(health)
+    response.headers["Cache-Control"] = "no-store, private"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@app.route("/api/wa_safety/pause", methods=["POST"])
+def api_wa_safety_pause():
+    security_error = _channel_mutation_error()
+    if security_error:
+        return security_error
+    data = request.get_json(silent=True) or {}
+    paused = data.get("paused")
+    if not isinstance(paused, bool) or data.get("confirm") is not True:
+        return jsonify({
+            "ok": False,
+            "error": "Confirma explicitamente si deseas pausar o reanudar los envios.",
+        }), 400
+    if paused is False and data.get("review_confirmed") is not True:
+        return jsonify({
+            "ok": False,
+            "error": "Confirma que revisaste el estado y las politicas antes de reanudar.",
+        }), 400
+    health = _set_wa_operator_pause(
+        paused,
+        WA_SAFETY_CONTROL_FILE,
+        WA_SAFETY_HEALTH_FILE,
+    )
+    return jsonify({
+        "ok": True,
+        "operator_paused": health["operator_paused"],
+        "delivery_blocked": health["delivery_blocked"],
+    })
 
 
 @app.route("/api/wa_call_health")
@@ -3376,14 +3773,27 @@ def restart_wa_bot() -> int | None:
 
 def _test_mode_payload() -> dict:
     can_manage = _can_manage_channels()
-    empty_summary = {"conversation_count": 0, "latest_updated_at": None}
     return {
         "ok": True,
         "enabled": load_test_mode(TEST_MODE_FILE),
         "can_manage": can_manage,
-        "telegram": interaction_state_summary(TG_INTERACTION_STATE_FILE) if can_manage else empty_summary,
-        "whatsapp": interaction_state_summary(WA_INTERACTION_STATE_FILE) if can_manage else empty_summary,
     }
+
+
+def _restore_state_snapshot(path: Path, content: bytes | None) -> None:
+    """Restore one state file atomically, including its previous absence."""
+
+    if content is None:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".restore.tmp")
+    temporary.write_bytes(content)
+    try:
+        os.chmod(temporary, 0o600)
+    except OSError:
+        pass
+    os.replace(temporary, path)
 
 
 def _test_mode_switch_conflict(channels: list[str]) -> str | None:
@@ -3395,6 +3805,17 @@ def _test_mode_switch_conflict(channels: list[str]) -> str | None:
             if _load_wa_switch_operation():
                 return "Termina o cancela primero el cambio de cuenta de WhatsApp."
     return None
+
+
+@app.after_request
+def _protect_test_mode_responses(response):
+    """Prevent any test-mode response, including errors, from being cached."""
+
+    if request.path in {"/api/test_mode", "/api/test_mode/reset"}:
+        response.headers["Cache-Control"] = "no-store, private"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 @app.route("/api/test_mode", methods=["GET", "POST"])
@@ -3433,14 +3854,25 @@ def api_test_mode_reset():
     selected = data.get("channel")
     if selected not in {"telegram", "whatsapp", "both"}:
         return jsonify({"ok": False, "error": "Canal de prueba inválido."}), 400
+    target = data.get("target", "latest")
+    if target not in {"latest", "number"}:
+        return jsonify({"ok": False, "error": "Destino de prueba inválido."}), 400
+    if target == "number" and selected != "whatsapp":
+        return jsonify({
+            "ok": False,
+            "error": "El número específico sólo está disponible para WhatsApp.",
+        }), 400
+    whatsapp_number = data.get("whatsapp_number") if target == "number" else None
+    if target == "number" and normalize_whatsapp_phone(whatsapp_number) is None:
+        return jsonify({
+            "ok": False,
+            "error": "Escribe un número internacional válido con código de país.",
+        }), 400
     selected_language = data.get("language", "auto")
     if selected_language not in {"auto", "es", "en", "fr"}:
         return jsonify({"ok": False, "error": "Idioma de prueba inválido."}), 400
     preset_language = None if selected_language == "auto" else selected_language
     channels = ["telegram", "whatsapp"] if selected == "both" else [selected]
-    conflict = _test_mode_switch_conflict(channels)
-    if conflict:
-        return jsonify({"ok": False, "error_code": "account_switch_in_progress", "error": conflict}), 409
 
     state_paths = {
         "telegram": TG_INTERACTION_STATE_FILE,
@@ -3448,10 +3880,34 @@ def api_test_mode_reset():
     }
     results = {}
     restart_warnings = []
-    with _test_mode_lock:
+    reset_error = None
+    rollback_complete = True
+    state_snapshots = None
+
+    # Account switches use the same locks.  Holding them through conflict
+    # detection, worker shutdown, state mutation and restart closes the race
+    # where a switch could begin midway through a reset.
+    with _test_mode_lock, _telegram_switch_lock, _wa_switch_lock, _wa_process_lock:
+        if not load_test_mode(TEST_MODE_FILE):
+            return jsonify({
+                "ok": False,
+                "error_code": "test_mode_disabled",
+                "error": "Activa primero el modo de prueba.",
+            }), 409
+        conflict = _test_mode_switch_conflict(channels)
+        if conflict:
+            return jsonify({
+                "ok": False,
+                "error_code": "account_switch_in_progress",
+                "error": conflict,
+            }), 409
+
         pending = [
             channel for channel in channels
-            if interaction_state_summary(state_paths[channel])["conversation_count"] > 0
+            if (
+                interaction_state_summary(state_paths[channel])["conversation_count"] > 0
+                or (channel == "whatsapp" and target == "number")
+            )
         ]
         telegram_was_running = False
         whatsapp_was_running = False
@@ -3467,42 +3923,93 @@ def api_test_mode_reset():
                 _stop_wa_process(whatsapp_pid_file)
 
         try:
-            for channel in channels:
-                result = reset_latest_interaction(
-                    state_paths[channel],
-                    channel=channel,
-                    backup_dir=TEST_MODE_BACKUP_DIR,
-                    language=preset_language,
+            state_snapshots = {
+                channel: (
+                    state_paths[channel].read_bytes()
+                    if state_paths[channel].exists() else None
                 )
+                for channel in channels
+            }
+            for channel in channels:
+                if channel == "whatsapp" and target == "number":
+                    result = reset_whatsapp_interaction_by_number(
+                        state_paths[channel],
+                        backup_dir=TEST_MODE_BACKUP_DIR,
+                        phone=whatsapp_number,
+                        language=preset_language,
+                    )
+                else:
+                    result = reset_latest_interaction(
+                        state_paths[channel],
+                        channel=channel,
+                        backup_dir=TEST_MODE_BACKUP_DIR,
+                        language=preset_language,
+                    )
                 results[channel] = {
                     "reset": result["reset"],
-                    "remaining": result["remaining"],
                     "language": selected_language,
-                    "backup_created": bool(result["backup"]),
                 }
+                if target != "number":
+                    results[channel].update({
+                        "remaining": result["remaining"],
+                        "backup_created": bool(result["backup"]),
+                    })
         except OSError:
-            return jsonify({
-                "ok": False,
-                "error": "No fue posible guardar el estado de prueba; los respaldos existentes se conservaron.",
-            }), 500
+            results = {}
+            if state_snapshots is None:
+                reset_error = "No fue posible preparar un respaldo del estado de prueba."
+            else:
+                reset_error = (
+                    "No fue posible guardar el estado de prueba. "
+                    "Se intentó restaurar el estado anterior de ambos canales."
+                )
+                for channel, content in state_snapshots.items():
+                    try:
+                        _restore_state_snapshot(state_paths[channel], content)
+                    except OSError:
+                        rollback_complete = False
         finally:
             if telegram_was_running:
-                started, message = restart_telegram_worker()
-                if not started:
-                    restart_warnings.append(f"Telegram: {message}")
-            if whatsapp_was_running and not restart_wa_bot():
-                restart_warnings.append("WhatsApp no pudo reiniciarse automáticamente.")
+                try:
+                    started, message = restart_telegram_worker()
+                    if not started:
+                        restart_warnings.append(f"Telegram: {message}")
+                except Exception:
+                    restart_warnings.append("Telegram no pudo reiniciarse automáticamente.")
+            if whatsapp_was_running:
+                try:
+                    if not restart_wa_bot():
+                        restart_warnings.append("WhatsApp no pudo reiniciarse automáticamente.")
+                except Exception:
+                    restart_warnings.append("WhatsApp no pudo reiniciarse automáticamente.")
 
     response = {
-        "ok": not restart_warnings,
+        "ok": reset_error is None and not restart_warnings,
         "results": results,
         "restart_warnings": restart_warnings,
-        "state": _test_mode_payload(),
+        "rollback_complete": rollback_complete,
     }
+    if target != "number":
+        response["state"] = _test_mode_payload()
+    if reset_error:
+        response["error"] = (
+            reset_error
+            if rollback_complete
+            else (
+                "El reinicio falló y la restauración no pudo completarse. "
+                "Los respaldos se conservaron para recuperación manual."
+            )
+        )
+        result = jsonify(response)
+        return result, 500
     if restart_warnings:
         response["error"] = "El estado se reinició, pero un servicio requiere reinicio manual."
-        return jsonify(response), 503
-    return jsonify(response)
+        result = jsonify(response)
+        result.headers["Cache-Control"] = "no-store, private"
+        return result, 503
+    result = jsonify(response)
+    result.headers["Cache-Control"] = "no-store, private"
+    return result
 
 
 def _wa_switch_token_digest(token: str) -> str:

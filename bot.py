@@ -16,7 +16,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import re
 import time
 from types import SimpleNamespace
 import uuid
@@ -25,6 +24,7 @@ from telethon import TelegramClient, errors, events, utils
 from telethon.tl import types
 
 from interaction_state import PersistentInteractionState
+from language_detection import detect_language
 from message_schema import load_message_file
 from telegram_audio_branding import (
     brand_audio_attributes,
@@ -129,53 +129,8 @@ interaction_state = PersistentInteractionState(
 )
 
 
-LANG_KEYWORDS = {
-    "es": re.compile(
-        r"\b(hola|gracias|por\s*favor|buenos\s*días|quiero|necesito|ayuda|habla|"
-        r"precio|precios|tarifa|tarifas|reserva|reservas|foto|fotos|vídeo|vídeos|video|videos|"
-        r"buenas|amigo|claro|vale|dale|listo|entiendo|puedes|hacer|"
-        r"dónde|cuándo|cómo|cuál|quién|eso|esto|algo|nada|todo|más|menos|"
-        r"está|estoy|estamos|están|tengo|tiene|tenemos|soy|eres|somos|son)\b",
-        re.IGNORECASE,
-    ),
-    "en": re.compile(
-        r"\b(hello|hi|thanks|thank\s*you|please|help|want|need|can\s*i|"
-        r"price|prices|rate|rates|book|booking|photo|photos|video|videos|"
-        r"yes|sure|fine|good|great|hey|would|could|should|"
-        r"where|when|how|what|who|that|this|there|here|"
-        r"is|are|am|have|has|do|does|did|will|may|might)\b",
-        re.IGNORECASE,
-    ),
-    "fr": re.compile(
-        r"\b(bonjour|merci|s'il\s*vous\s*plaît|aide|besoin|vouloir|"
-        r"prix|tarif|tarifs|réservation|réserver|photo|photos|vidéo|vidéos|"
-        r"oui|d'accord|bien|tres|peux|peut|où|quand|comment|quoi|qui|que|"
-        r"est|suis|sommes|êtes|sont|ai|as|a|avons|avez|ont|"
-        r"je|tu|il|elle|nous|vous|ils|elles|"
-        r"ce|cet|cette|ces|mon|ton|son|ma|ta|sa)\b",
-        re.IGNORECASE,
-    ),
-}
-AMBIGUOUS = {"ok", "no", "si", "hey"}
-LANG_MARKERS = {
-    "es": re.compile(r"\b(español|castellano|hablo español|hablo espanol)\b", re.IGNORECASE),
-    "en": re.compile(r"\b(english|speak english)\b", re.IGNORECASE),
-    "fr": re.compile(r"\b(français|francais|parle français|parle francais)\b", re.IGNORECASE),
-}
-
-
 def detect_lang(text: str) -> str | None:
-    scores = {"es": 0.0, "en": 0.0, "fr": 0.0}
-    for language, pattern in LANG_KEYWORDS.items():
-        for match in pattern.findall(text):
-            if match.lower() not in AMBIGUOUS:
-                scores[language] += 1.0
-    for language, marker in LANG_MARKERS.items():
-        if marker.search(text):
-            scores[language] += 20
-    if max(scores.values()) < 1:
-        return None
-    return max(scores, key=scores.get)
+    return detect_language(text)
 
 
 def load_messages_fresh() -> None:

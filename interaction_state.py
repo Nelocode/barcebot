@@ -94,6 +94,9 @@ class PersistentInteractionState:
                 clean[contact_key] = {
                     "phase": phase,
                     "language": language,
+                    "language_provisional": bool(
+                        language and raw.get("language_provisional") is True
+                    ),
                     "recent_events": events[-self.max_recent_events :],
                     "updated_at": raw.get("updated_at", 0),
                 }
@@ -124,6 +127,7 @@ class PersistentInteractionState:
         event_id: object,
         kind: str,
         detected_language: str | None = None,
+        provisional_language: str | None = None,
     ) -> InteractionDecision:
         """Atomically claims an event before any outbound delivery occurs."""
 
@@ -135,6 +139,8 @@ class PersistentInteractionState:
             raise ValueError("kind must be call or content")
         if detected_language not in VALID_LANGUAGES:
             detected_language = None
+        if provisional_language not in VALID_LANGUAGES:
+            provisional_language = None
 
         contact_key = self._fingerprint("contact", contact_id)
         event_key = self._fingerprint("event", event_id)
@@ -143,6 +149,7 @@ class PersistentInteractionState:
             state = {
                 "phase": 0,
                 "language": None,
+                "language_provisional": False,
                 "recent_events": [],
                 "updated_at": 0,
             }
@@ -158,9 +165,17 @@ class PersistentInteractionState:
             )
 
         language = state.get("language")
-        if language not in VALID_LANGUAGES and detected_language:
+        if detected_language and (
+            language not in VALID_LANGUAGES
+            or state.get("language_provisional") is True
+        ):
             language = detected_language
             state["language"] = detected_language
+            state["language_provisional"] = False
+        elif language not in VALID_LANGUAGES and provisional_language:
+            language = provisional_language
+            state["language"] = provisional_language
+            state["language_provisional"] = True
         effective_language = language or self.default_language
 
         previous_phase = state["phase"]
@@ -197,6 +212,7 @@ class PersistentInteractionState:
         event_id: object,
         kind: str,
         detected_language: str | None = None,
+        provisional_language: str | None = None,
     ) -> InteractionDecision:
         """Calcula la respuesta sin consumir la interacción todavía.
 
@@ -212,6 +228,8 @@ class PersistentInteractionState:
             raise ValueError("kind must be call or content")
         if detected_language not in VALID_LANGUAGES:
             detected_language = None
+        if provisional_language not in VALID_LANGUAGES:
+            provisional_language = None
 
         contact_key = self._fingerprint("contact", contact_id)
         event_key = self._fingerprint("event", event_id)
@@ -227,7 +245,15 @@ class PersistentInteractionState:
                 language=language or self.default_language,
             )
 
-        effective_language = language or detected_language or self.default_language
+        if detected_language and (
+            language not in VALID_LANGUAGES
+            or (state and state.get("language_provisional") is True)
+        ):
+            effective_language = detected_language
+        else:
+            effective_language = (
+                language or provisional_language or self.default_language
+            )
         if kind == "call":
             response_key = "call"
         else:

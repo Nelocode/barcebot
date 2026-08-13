@@ -119,6 +119,7 @@ class TelegramInteractionDispatcher:
                 event_id=event_id,
                 kind=kind,
                 detected_language=detected_language,
+                provisional_language="es" if detected_language is None else None,
             )
             if not decision.duplicate and decision.response_key:
                 delivery_fingerprint = interaction_delivery_fingerprint(chat_id, event_id)
@@ -133,5 +134,6 @@ class TelegramInteractionDispatcher:
                     event_id=event_id,
                     kind=kind,
                     detected_language=detected_language,
+                    provisional_language="es" if detected_language is None else None,
                 )
             return decision

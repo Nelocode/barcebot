@@ -53,6 +53,55 @@ test('procesa el arreglo de llamadas que entrega Baileys', async () => {
   ]);
 });
 
+test('la llamada entrega al estado el idioma provisional derivado de +57', async () => {
+  let routed;
+  const { handler } = createHarness({
+    routeInteraction: details => {
+      routed = details;
+      return { duplicate: false, language: details.provisionalLanguage, contactKey: 'opaque' };
+    },
+    getResponseMessage: () => ({ text: '', audio: '' }),
+  });
+  await handler([offer()]);
+  assert.equal(routed.detectedLanguage, null);
+  assert.equal(routed.provisionalLanguage, 'es');
+});
+
+test('una llamada solo-LID usa el PN resuelto para el idioma provisional', async () => {
+  let routed;
+  const { handler } = createHarness({
+    resolveContactId: async () => '573001234567@s.whatsapp.net',
+    routeInteraction: details => {
+      routed = details;
+      return { duplicate: false, language: details.provisionalLanguage, contactKey: 'opaque' };
+    },
+    getResponseMessage: () => ({ text: '', audio: '' }),
+  });
+  await handler([offer({ from: '123@lid', chatId: '123@lid', callerPn: undefined })]);
+  assert.equal(routed.contactId, '573001234567@s.whatsapp.net');
+  assert.equal(routed.provisionalLanguage, 'es');
+});
+
+test('una pausa rechaza la llamada sin consumir el estado de interacción', async () => {
+  let routed = 0;
+  const { handler, effects, metrics } = createHarness({
+    deliveryAllowed: () => false,
+    routeInteraction: () => {
+      routed += 1;
+      return { duplicate: false, language: 'es', contactKey: 'contact' };
+    },
+    getResponseMessage: () => ({ text: 'no debe enviarse', audio: '' }),
+  });
+
+  const result = await handler([offer({ id: 'paused-call' })]);
+
+  assert.equal(result[0].status, 'ignored');
+  assert.equal(result[0].reason, 'delivery_blocked');
+  assert.equal(routed, 0);
+  assert.deepEqual(effects, [['reject', 'paused-call', '573001234567@s.whatsapp.net']]);
+  assert.equal(metrics.at(-1).reason, 'delivery_blocked');
+});
+
 test('envia OGG/Opus como nota de voz cuando el lector lo proporciona', async () => {
   const { handler, effects } = createHarness({
     readAudio: async () => ({

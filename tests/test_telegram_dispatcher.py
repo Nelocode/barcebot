@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -16,6 +17,30 @@ from telegram_dispatcher import (
 
 
 class TelegramInteractionDispatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_spanish_is_provisional_until_text_identifies_language(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state = PersistentInteractionState(state_path)
+            deliveries = []
+
+            async def send_response(_peer, key, language, _fingerprint):
+                deliveries.append((key, language))
+
+            dispatcher = TelegramInteractionDispatcher(state, send_response)
+            await dispatcher.dispatch(chat_id=1, event_id="call:1", kind="call")
+            await dispatcher.dispatch(
+                chat_id=1,
+                event_id="message:2",
+                kind="content",
+                detected_language="en",
+            )
+
+            self.assertEqual([("call", "es"), ("step2", "en")], deliveries)
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            contact = next(iter(persisted["contacts"].values()))
+            self.assertEqual("en", contact["language"])
+            self.assertFalse(contact["language_provisional"])
+
     async def test_call_delivers_audio_before_text(self):
         order = []
 

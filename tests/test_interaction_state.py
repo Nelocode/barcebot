@@ -116,6 +116,51 @@ class PersistentInteractionStateTests(unittest.TestCase):
             self.assertEqual("fr", text.language)
             self.assertEqual("step2", text.response_key)
 
+    def test_provisional_language_survives_reload_and_detected_text_replaces_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            store = PersistentInteractionState(state_path)
+            first = store.register(
+                contact_id=1,
+                event_id="call:1",
+                kind="call",
+                provisional_language="es",
+            )
+            self.assertEqual("es", first.language)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertTrue(next(iter(saved["contacts"].values()))["language_provisional"])
+
+            text = PersistentInteractionState(state_path).register(
+                contact_id=1,
+                event_id="message:2",
+                kind="content",
+                detected_language="en",
+            )
+            self.assertEqual("en", text.language)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            contact = next(iter(saved["contacts"].values()))
+            self.assertEqual("en", contact["language"])
+            self.assertFalse(contact["language_provisional"])
+
+    def test_confirmed_language_is_not_replaced_by_a_later_hint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            first = store.register(
+                contact_id=1,
+                event_id="message:1",
+                kind="content",
+                detected_language="fr",
+                provisional_language="es",
+            )
+            following = store.register(
+                contact_id=1,
+                event_id="message:2",
+                kind="content",
+                provisional_language="en",
+            )
+            self.assertEqual("fr", first.language)
+            self.assertEqual("fr", following.language)
+
     def test_state_file_does_not_contain_raw_customer_or_event_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             store = self.make_store(directory)

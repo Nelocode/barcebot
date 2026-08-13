@@ -18,6 +18,7 @@ const REASONS = new Set([
   'missing_identity',
   'group_call',
   'duplicate',
+  'delivery_blocked',
   'unexpected_error',
   'never',
 ]);
