@@ -87,6 +87,65 @@ class BotFatherProvisionalLanguageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(botfather_bot.detect_lang("photo"))
         self.assertIsNone(botfather_bot.detect_lang("video"))
 
+    def test_weak_language_needs_two_consecutive_messages_after_provisional(self):
+        state, _ = botfather_bot.update_user_language(None, None, now=100)
+        first, _ = botfather_bot.update_user_language(
+            state,
+            None,
+            now=101,
+            language_evidence={
+                "language": "en",
+                "strong": False,
+                "explicit": False,
+                "score": 4,
+                "margin": 4,
+            },
+        )
+        self.assertEqual("es", first["lang"])
+        self.assertEqual("en", first["language_candidate"])
+        second, _ = botfather_bot.update_user_language(
+            first,
+            None,
+            now=102,
+            language_evidence={
+                "language": "en",
+                "strong": False,
+                "explicit": False,
+                "score": 4,
+                "margin": 4,
+            },
+        )
+
+        self.assertEqual("en", second["lang"])
+        self.assertFalse(second["language_provisional"])
+
+    def test_strong_evidence_overrides_operator_seed_and_clears_candidate(self):
+        seeded = {
+            "lang": "fr",
+            "language_provisional": False,
+            "language_source": "operator_seed",
+            "language_candidate": "en",
+            "language_candidate_streak": 1,
+            "step": 0,
+            "last_seen": 100,
+        }
+        updated, _ = botfather_bot.update_user_language(
+            seeded,
+            None,
+            now=101,
+            language_evidence={
+                "language": "es",
+                "strong": True,
+                "explicit": False,
+                "score": 11,
+                "margin": 11,
+            },
+        )
+
+        self.assertEqual("es", updated["lang"])
+        self.assertEqual("detected", updated["language_source"])
+        self.assertIsNone(updated["language_candidate"])
+
 
 if __name__ == "__main__":
     unittest.main()

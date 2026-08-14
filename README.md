@@ -49,12 +49,12 @@ El panel incluye un modo de prueba reversible para repetir el flujo completo con
 el mismo celular:
 
 1. Vincula y confirma los canales desde el navegador administrador.
-2. Para Telegram, o si quieres usar el atajo de actividad reciente, envía una
+2. Para el Telegram User Bot, o si quieres usar el atajo de actividad reciente, envía una
    interacción desde el celular de prueba para que sea la conversación más reciente.
 3. Activa **Modo de prueba de conversaciones** en el panel.
 4. Elige detección automática, español, inglés o francés. Seleccionar un idioma
    permite probar una llamada como primera interacción, aunque no contenga texto.
-5. Reinicia la conversación más reciente de Telegram, WhatsApp o ambas. En
+5. Reinicia la conversación más reciente del Telegram User Bot, WhatsApp o ambas. En
    WhatsApp también puedes indicar directamente el número internacional del
    celular cliente, incluso antes de su primera interacción.
 6. La siguiente interacción de ese celular empezará nuevamente en **Paso 1** y
@@ -67,6 +67,16 @@ hash que usa WhatsApp: nunca se escribe en texto legible ni se devuelve al
 navegador. El atajo de
 "conversación más reciente" no debe usarse mientras haya tráfico real de otros
 clientes.
+
+### Adaptación local del idioma
+
+El bot analiza localmente texto en español, inglés y francés con reglas Unicode
+compartidas por los procesos de JavaScript y Python. El idioma derivado del
+prefijo telefónico de WhatsApp, o el español inicial de Telegram, es sólo
+provisional: una evidencia fuerte o una petición expresa lo corrige de inmediato;
+una señal débil diferente debe repetirse en dos mensajes consecutivos. La
+detección es conservadora y no pretende ser perfecta. El estado conserva sólo
+el idioma, su origen y una racha acotada; no guarda texto ni tokens del cliente.
 
 ### Salud operativa de WhatsApp
 

@@ -11,7 +11,8 @@ from pathlib import Path
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from language_detection import detect_language
+from language_adaptation import reduce_language_state
+from language_detection import detect_language, detect_language_evidence
 
 # ── Config ────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -68,8 +69,26 @@ def detect_lang(text: str) -> str | None:
     return detect_language(text)
 
 
-def is_expired(state: dict) -> bool:
-    return time.time() - state.get("last_seen", 0) > RESET_TIMEOUT
+def detect_lang_evidence(text: str) -> dict[str, object]:
+    return detect_language_evidence(text)
+
+
+def evidence_class(evidence: dict[str, object] | None) -> str:
+    """Return a content-free label suitable for aggregate operational logs."""
+    if not evidence:
+        return "none"
+    if evidence.get("explicit"):
+        return "explicit"
+    if evidence.get("strong"):
+        return "strong"
+    if evidence.get("language"):
+        return "weak"
+    return "ambiguous"
+
+
+def is_expired(state: dict, *, now: float | None = None) -> bool:
+    current_time = time.time() if now is None else now
+    return current_time - state.get("last_seen", 0) > RESET_TIMEOUT
 
 
 def update_user_language(
@@ -77,22 +96,39 @@ def update_user_language(
     detected_language: str | None,
     *,
     now: float,
+    language_evidence: dict[str, object] | None = None,
 ) -> tuple[dict, bool]:
-    """Keep a fallback provisional until a message supplies evidence."""
+    """Apply the same pure language reducer used by Telegram preview/register."""
 
-    is_new = state is None or is_expired(state)
+    is_new = state is None or is_expired(state, now=now)
     if is_new:
         state = {
-            "lang": detected_language or "es",
-            "language_provisional": detected_language is None,
+            "lang": None,
+            "language_provisional": False,
+            "language_source": None,
+            "language_candidate": None,
+            "language_candidate_streak": 0,
             "step": 0,
             "last_seen": now,
         }
-    else:
-        if detected_language and state.get("language_provisional") is True:
-            state["lang"] = detected_language
-            state["language_provisional"] = False
-        state["last_seen"] = now
+    reduced = reduce_language_state(
+        {
+            "language": state.get("lang"),
+            "language_provisional": state.get("language_provisional") is True,
+            "language_source": state.get("language_source"),
+            "language_candidate": state.get("language_candidate"),
+            "language_candidate_streak": state.get("language_candidate_streak", 0),
+        },
+        detected_language=detected_language,
+        language_evidence=language_evidence,
+        provisional_language="es",
+    )
+    state["lang"] = reduced.get("language") or "es"
+    state["language_provisional"] = reduced.get("language_source") == "provisional"
+    state["language_source"] = reduced.get("language_source") or "provisional"
+    state["language_candidate"] = reduced.get("language_candidate")
+    state["language_candidate_streak"] = reduced.get("language_candidate_streak", 0)
+    state["last_seen"] = now
     return state, is_new
 
 
@@ -116,18 +152,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = (update.message.text or update.message.caption or "").strip()
-    detected = detect_lang(text) if text else None
+    evidence = detect_lang_evidence(text) if text else None
 
     now = time.time()
     state = user_state.get(chat_id)
     had_state = state is not None
 
-    state, is_new = update_user_language(state, detected, now=now)
+    state, is_new = update_user_language(
+        state,
+        None,
+        now=now,
+        language_evidence=evidence,
+    )
     user_state[chat_id] = state
 
     if is_new:
         if had_state:
-            logging.info("[BF chat=%s] EXPIRED — new cycle", chat_id)
+            logging.info("[BF] Conversation expired; new cycle")
         load_messages_fresh()
         step_to_use = 0
     else:
@@ -153,22 +194,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     logging.info(
-        "[BF chat=%s lang=%s step=%s] %r → %r",
-        chat_id, lang, step_to_use, text[:60], msg_text[:60],
+        "[BF] Interaction processed lang=%s step=%s evidence=%s",
+        lang,
+        step_to_use,
+        evidence_class(evidence),
     )
 
 
 async def handle_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Voice/video note treated as call."""
     chat_id = update.effective_chat.id
-    logging.info("[BF chat=%s] VOICE/VIDEO received", chat_id)
+    logging.info("[BF] Media interaction received")
 
     caption = (update.message.caption or "").strip()
-    detected = detect_lang(caption) if caption else None
+    evidence = detect_lang_evidence(caption) if caption else None
     state, _is_new = update_user_language(
         user_state.get(chat_id),
-        detected,
+        None,
         now=time.time(),
+        language_evidence=evidence,
     )
     user_state[chat_id] = state
     lang = state["lang"]
@@ -198,7 +242,7 @@ async def handle_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logging.error("[BF] Error: %s", context.error)
+    logging.error("[BF] Handler error type=%s", type(context.error).__name__)
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -229,7 +273,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE | filters.VIDEO_NOTE, handle_call))
     app.add_error_handler(error_handler)
 
-    logging.info("BotFather bot starting... (token=%s...)", BOT_TOKEN[:8])
+    logging.info("BotFather bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

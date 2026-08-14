@@ -19,6 +19,10 @@ function createStore(directory, overrides = {}) {
   });
 }
 
+function evidence(language, { strong = false, score = strong ? 7 : 4, margin = score } = {}) {
+  return { language, strong, explicit: false, score, margin };
+}
+
 test('cada llamada distinta usa call y el contenido posterior usa step2', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-state-'));
   const store = createStore(directory);
@@ -103,7 +107,7 @@ test('un idioma provisional se persiste y el primer texto detectado lo reemplaza
     contactId: '573001234567@s.whatsapp.net',
     eventId: 'message:text',
     kind: 'content',
-    detectedLanguage: 'en',
+    languageEvidence: { language: 'en', strong: true, explicit: false, score: 7, margin: 7 },
   });
   assert.equal(text.language, 'en');
   const persisted = Object.values(JSON.parse(fs.readFileSync(filePath, 'utf8')).contacts)[0];
@@ -124,7 +128,7 @@ test('texto confirmado prevalece sobre indicios y sobre un provisional al fusion
     contactId: '123@lid',
     eventId: 'message:1',
     kind: 'content',
-    detectedLanguage: 'en',
+    languageEvidence: { language: 'en', strong: true, explicit: false, score: 7, margin: 7 },
   });
   const merged = store.register({
     contactId: '573001234567@s.whatsapp.net',
@@ -176,6 +180,165 @@ test('fusiona LID y PN y conserva el alias después de reiniciar', () => {
   assert.equal(Object.keys(JSON.parse(fs.readFileSync(filePath, 'utf8')).contacts).length, 1);
 });
 
+test('fusionar dos candidate streak1 conserva una sola racha sin confirmar', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-state-'));
+  let tick = 0;
+  const store = createStore(directory, { now: () => ++tick });
+  const pn = '573001234567@s.whatsapp.net';
+  const lid = '123@lid';
+  for (const [contactId, suffix] of [[pn, 'pn'], [lid, 'lid']]) {
+    store.register({
+      contactId,
+      eventId: `message:es-${suffix}`,
+      kind: 'content',
+      languageEvidence: evidence('es', { strong: true }),
+    });
+    store.register({
+      contactId,
+      eventId: `message:en-${suffix}`,
+      kind: 'content',
+      languageEvidence: evidence('en'),
+    });
+  }
+
+  const merged = store.register({
+    contactId: pn,
+    contactAliases: [lid],
+    eventId: 'call:merge',
+    kind: 'call',
+  });
+  const persisted = Object.values(store.contacts)[0];
+  assert.equal(Object.keys(store.contacts).length, 1);
+  assert.equal(merged.language, 'es');
+  assert.equal(persisted.language_candidate, 'en');
+  assert.equal(persisted.language_candidate_streak, 1);
+});
+
+test('candidato dÃ©bil requiere dos eventos y sobrevive recarga y evento no textual', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-state-'));
+  const filePath = path.join(directory, 'state.json');
+  const store = createStore(directory);
+  store.register({
+    contactId: 'a',
+    eventId: 'message:es',
+    kind: 'content',
+    languageEvidence: evidence('es', { strong: true }),
+  });
+  const first = store.register({
+    contactId: 'a',
+    eventId: 'message:en-1',
+    kind: 'content',
+    languageEvidence: evidence('en'),
+  });
+  assert.equal(first.language, 'es');
+  assert.equal(first.languageCandidate, 'en');
+  assert.equal(first.languageCandidateStreak, 1);
+
+  const bytesBeforeDuplicate = fs.readFileSync(filePath);
+  const duplicate = store.register({
+    contactId: 'a',
+    eventId: 'message:en-1',
+    kind: 'content',
+    languageEvidence: evidence('fr', { strong: true }),
+  });
+  assert.equal(duplicate.duplicate, true);
+  assert.deepEqual(fs.readFileSync(filePath), bytesBeforeDuplicate);
+
+  const reloaded = createStore(directory);
+  reloaded.register({ contactId: 'a', eventId: 'call:1', kind: 'call' });
+  assert.equal(Object.values(reloaded.contacts)[0].language_candidate, 'en');
+  const second = reloaded.register({
+    contactId: 'a',
+    eventId: 'message:en-2',
+    kind: 'content',
+    languageEvidence: evidence('en'),
+  });
+  assert.equal(second.language, 'en');
+  assert.equal(second.languageCandidate, null);
+});
+
+test('un dÃ©bil distinto no reemplaza provisional hasta el segundo evento', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-state-'));
+  const store = createStore(directory);
+  store.register({
+    contactId: 'a',
+    eventId: 'image:1',
+    kind: 'content',
+    provisionalLanguage: 'fr',
+  });
+  const first = store.register({
+    contactId: 'a',
+    eventId: 'message:es-1',
+    kind: 'content',
+    languageEvidence: evidence('es'),
+  });
+  const second = store.register({
+    contactId: 'a',
+    eventId: 'message:es-2',
+    kind: 'content',
+    languageEvidence: evidence('es'),
+  });
+  assert.equal(first.language, 'fr');
+  assert.equal(second.language, 'es');
+});
+
+test('evidencia fuerte reemplaza operator_seed y limpia candidato', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-state-'));
+  const filePath = path.join(directory, 'state.json');
+  const contactKey = fingerprintForTest('contact', 'a');
+  fs.writeFileSync(filePath, JSON.stringify({
+    version: 2,
+    contacts: {
+      [contactKey]: {
+        phase: 0,
+        language: 'fr',
+        language_provisional: false,
+        language_source: 'operator_seed',
+        language_candidate: 'en',
+        language_candidate_streak: 1,
+        recent_events: [],
+        updated_at: 0,
+      },
+    },
+    aliases: { [contactKey]: contactKey },
+  }), 'utf8');
+  const store = createStore(directory);
+  const decision = store.register({
+    contactId: 'a',
+    eventId: 'message:es',
+    kind: 'content',
+    languageEvidence: evidence('es', { strong: true, score: 11, margin: 11 }),
+  });
+  assert.equal(decision.language, 'es');
+  const persisted = Object.values(JSON.parse(fs.readFileSync(filePath, 'utf8')).contacts)[0];
+  assert.equal(persisted.language_source, 'detected');
+  assert.equal(persisted.language_candidate, null);
+});
+
+test('evidencia malformada falla cerrada y no se persiste cruda', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-state-'));
+  const filePath = path.join(directory, 'state.json');
+  const store = createStore(directory);
+  store.register({
+    contactId: 'a',
+    eventId: 'message:es',
+    kind: 'content',
+    languageEvidence: evidence('es', { strong: true }),
+  });
+  const decision = store.register({
+    contactId: 'a',
+    eventId: 'message:invalid',
+    kind: 'content',
+    languageEvidence: {
+      ...evidence('fr', { strong: true }),
+      raw_text: 'sensitive-customer-content',
+    },
+  });
+  const serialized = fs.readFileSync(filePath, 'utf8');
+  assert.equal(decision.language, 'es');
+  assert.doesNotMatch(serialized, /raw_text|sensitive-customer-content/);
+});
+
 test('un reset PN pendiente prevalece sobre historial LID en ambos órdenes de identidad', () => {
   for (const pendingFirst of [false, true]) {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-state-'));
@@ -203,6 +366,10 @@ test('un reset PN pendiente prevalece sobre historial LID en ambos órdenes de i
     persisted.contacts[pnKey] = {
       phase: 0,
       language: 'en',
+      language_provisional: false,
+      language_source: 'operator_seed',
+      language_candidate: null,
+      language_candidate_streak: 0,
       recent_events: [],
       updated_at: 0,
       reset_pending: true,
@@ -216,7 +383,7 @@ test('un reset PN pendiente prevalece sobre historial LID en ambos órdenes de i
       contactAliases: [pendingFirst ? lid : pn],
       eventId: 'message:new-1',
       kind: 'content',
-      detectedLanguage: 'fr',
+      languageEvidence: { language: 'fr', strong: false, explicit: false, score: 4, margin: 4 },
     });
 
     assert.equal(first.responseKey, 'step1');
@@ -241,10 +408,10 @@ test('un reset PN pendiente prevalece sobre historial LID en ambos órdenes de i
       contactId: pn,
       eventId: 'message:new-2',
       kind: 'content',
-      detectedLanguage: 'fr',
+      languageEvidence: { language: 'fr', strong: false, explicit: false, score: 4, margin: 4 },
     });
     assert.equal(following.responseKey, 'step2');
-    assert.equal(following.language, 'en');
+    assert.equal(following.language, 'fr');
   }
 });
 
@@ -272,7 +439,7 @@ test('ignora un marcador reset_pending inválido fuera de fase cero', () => {
     contactId: contact,
     eventId: 'message:new',
     kind: 'content',
-    detectedLanguage: 'en',
+    languageEvidence: { language: 'en', strong: false, explicit: false, score: 4, margin: 4 },
   });
   assert.equal(decision.responseKey, 'step2');
   assert.equal(decision.language, 'es');

@@ -14,7 +14,7 @@ import { createWhatsAppCallHealth } from './wa_call_health.mjs';
 import { PersistentInteractionState } from './interaction_state.mjs';
 import { createWhatsAppMessageHandler } from './wa_message_handler.mjs';
 import { KeyedSerialQueue } from './keyed_serial_queue.mjs';
-import { detectLanguage as detectSupportedLanguage } from './language_detection.mjs';
+import { detectLanguageEvidence } from './language_detection.mjs';
 import { classifyWhatsAppDisconnect } from './wa_disconnect_policy.mjs';
 import { createWhatsAppVoiceNoteReader } from './wa_audio_delivery.mjs';
 import { applyWhatsAppProfilePicture } from './wa_profile_picture.mjs';
@@ -224,7 +224,7 @@ fs.watchFile(MESSAGES_FILE, () => {
 });
 
 function detectLang(text) {
-  return detectSupportedLanguage(text);
+  return detectLanguageEvidence(text);
 }
 
 // ── Estado por usuario ──

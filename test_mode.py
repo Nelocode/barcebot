@@ -177,6 +177,10 @@ def reset_whatsapp_interaction_by_number(
     contacts[canonical_key] = {
         "phase": 0,
         "language": language,
+        "language_provisional": False,
+        "language_source": "operator_seed" if language else None,
+        "language_candidate": None,
+        "language_candidate_streak": 0,
         "recent_events": [],
         "updated_at": previous_updated_at,
         # The PN can still be separate from an older LID-only history.  The
@@ -226,6 +230,10 @@ def reset_latest_interaction(
     contacts[latest_key] = {
         "phase": 0,
         "language": language,
+        "language_provisional": False,
+        "language_source": "operator_seed" if language else None,
+        "language_candidate": None,
+        "language_candidate_streak": 0,
         "recent_events": [],
         "updated_at": previous.get("updated_at", 0),
     }

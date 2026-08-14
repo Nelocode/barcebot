@@ -24,7 +24,7 @@ from telethon import TelegramClient, errors, events, utils
 from telethon.tl import types
 
 from interaction_state import PersistentInteractionState
-from language_detection import detect_language
+from language_detection import detect_language, detect_language_evidence
 from message_schema import load_message_file
 from telegram_audio_branding import (
     brand_audio_attributes,
@@ -131,6 +131,10 @@ interaction_state = PersistentInteractionState(
 
 def detect_lang(text: str) -> str | None:
     return detect_language(text)
+
+
+def detect_lang_evidence(text: str) -> dict[str, object]:
+    return detect_language_evidence(text)
 
 
 def load_messages_fresh() -> None:
@@ -434,6 +438,7 @@ async def process_interaction(
     event_id: str,
     kind: str,
     detected_language: str | None = None,
+    language_evidence: dict[str, object] | None = None,
     reply_peer: object | None = None,
 ) -> None:
     decision = await telegram_dispatcher.dispatch(
@@ -441,6 +446,7 @@ async def process_interaction(
         event_id=event_id,
         kind=kind,
         detected_language=detected_language,
+        language_evidence=language_evidence,
         reply_peer=reply_peer,
     )
     if decision.duplicate:
@@ -481,7 +487,7 @@ async def handle_message(event) -> None:
         chat_id=interaction.contact_id,
         event_id=interaction.event_id,
         kind=interaction.kind,
-        detected_language=detect_lang(interaction.text) if interaction.text else None,
+        language_evidence=detect_lang_evidence(interaction.text) if interaction.text else None,
         reply_peer=interaction.reply_peer,
     )
 

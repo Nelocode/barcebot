@@ -2,7 +2,12 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-const VALID_LANGUAGES = new Set(['es', 'en', 'fr']);
+import {
+  VALID_LANGUAGES,
+  reduceLanguageState,
+  sanitizeLanguageState,
+} from './language_adaptation.mjs';
+
 const VALID_KINDS = new Set(['call', 'content']);
 
 function fingerprint(namespace, value) {
@@ -48,9 +53,7 @@ export class PersistentInteractionState {
         const resetPending = raw.reset_pending === true && raw.phase === 0;
         this.contacts[contactKey] = {
           phase: raw.phase,
-          language: VALID_LANGUAGES.has(raw.language) ? raw.language : null,
-          language_provisional: VALID_LANGUAGES.has(raw.language)
-            && raw.language_provisional === true,
+          ...sanitizeLanguageState(raw),
           recent_events: !resetPending && Array.isArray(raw.recent_events)
             ? raw.recent_events.filter(item => typeof item === 'string').slice(-this.maxRecentEvents)
             : [],
@@ -95,6 +98,7 @@ export class PersistentInteractionState {
     eventId,
     kind,
     detectedLanguage = null,
+    languageEvidence = null,
     provisionalLanguage = null,
   }) {
     if (contactId === undefined || contactId === null || contactId === '') {
@@ -104,7 +108,6 @@ export class PersistentInteractionState {
       throw new TypeError('eventId is required');
     }
     if (!VALID_KINDS.has(kind)) throw new TypeError('kind must be call or content');
-    if (!VALID_LANGUAGES.has(detectedLanguage)) detectedLanguage = null;
     if (!VALID_LANGUAGES.has(provisionalLanguage)) provisionalLanguage = null;
 
     const identityValues = [contactId, ...(Array.isArray(contactAliases) ? contactAliases : [])]
@@ -123,10 +126,28 @@ export class PersistentInteractionState {
     const canonicalKey = pendingResetKey || existingKeys[0] || primaryKey;
     const states = existingKeys.map(key => this.contacts[key]);
     const pendingResetState = pendingResetKey ? this.contacts[pendingResetKey] : null;
+    // A duplicate is observational: it must not merge PN/LID records, consume
+    // a reset marker, advance a candidate streak, or rewrite aliases.
+    const duplicateStates = pendingResetState ? [pendingResetState] : states;
+    const duplicateState = duplicateStates.find(candidate => (
+      Array.isArray(candidate.recent_events) && candidate.recent_events.includes(eventKey)
+    ));
+    if (duplicateState) {
+      return {
+        duplicate: true,
+        phase: duplicateState.phase,
+        responseKey: null,
+        language: duplicateState.language || this.defaultLanguage,
+        languageSource: duplicateState.language_source || null,
+        languageCandidate: duplicateState.language_candidate || null,
+        languageCandidateStreak: duplicateState.language_candidate_streak || 0,
+        contactKey: canonicalKey,
+        persisted: true,
+      };
+    }
     const state = pendingResetState || states[0] || {
       phase: 0,
-      language: null,
-      language_provisional: false,
+      ...sanitizeLanguageState(null),
       recent_events: [],
       updated_at: 0,
     };
@@ -138,12 +159,16 @@ export class PersistentInteractionState {
     if (!pendingResetState) {
       for (const candidate of states.slice(1)) {
         state.phase = Math.max(state.phase, candidate.phase);
-        if (
-          candidate.language
-          && (!state.language || (state.language_provisional && !candidate.language_provisional))
-        ) {
-          state.language = candidate.language;
-          state.language_provisional = candidate.language_provisional === true;
+        const sourceRank = source => ({ detected: 4, operator_seed: 3, legacy: 2, provisional: 1 }[source] || 0);
+        if (candidate.language && (
+          !state.language
+          || sourceRank(candidate.language_source) > sourceRank(state.language_source)
+          || (
+            sourceRank(candidate.language_source) === sourceRank(state.language_source)
+            && candidate.updated_at > state.updated_at
+          )
+        )) {
+          Object.assign(state, sanitizeLanguageState(candidate));
         }
         state.updated_at = Math.max(state.updated_at, candidate.updated_at);
         state.recent_events = [...new Set([
@@ -161,25 +186,11 @@ export class PersistentInteractionState {
     for (const identityKey of identityKeys) this.aliases[identityKey] = canonicalKey;
     this.contacts[canonicalKey] = state;
 
-    if (state.recent_events.includes(eventKey)) {
-      const persisted = this.save();
-      return {
-        duplicate: true,
-        phase: state.phase,
-        responseKey: null,
-        language: state.language || this.defaultLanguage,
-        contactKey: canonicalKey,
-        persisted,
-      };
-    }
-
-    if (detectedLanguage && (!state.language || state.language_provisional)) {
-      state.language = detectedLanguage;
-      state.language_provisional = false;
-    } else if (!state.language && provisionalLanguage) {
-      state.language = provisionalLanguage;
-      state.language_provisional = true;
-    }
+    Object.assign(state, reduceLanguageState(state, {
+      detectedLanguage,
+      languageEvidence,
+      provisionalLanguage,
+    }));
     const language = state.language || this.defaultLanguage;
 
     let responseKey;
@@ -207,6 +218,9 @@ export class PersistentInteractionState {
       phase: state.phase,
       responseKey,
       language,
+      languageSource: state.language_source || null,
+      languageCandidate: state.language_candidate || null,
+      languageCandidateStreak: state.language_candidate_streak || 0,
       contactKey: canonicalKey,
       persisted,
     };

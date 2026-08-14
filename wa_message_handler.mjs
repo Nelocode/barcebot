@@ -276,14 +276,24 @@ export function createWhatsAppMessageHandler({
           normalizeJid(msg?.key?.remoteJidAlt || ''),
           jid,
         ].filter(Boolean);
-        const detectedLanguage = interaction.text ? detectLanguage(interaction.text) : null;
+        const languageObservation = interaction.text ? detectLanguage(interaction.text) : null;
+        const languageEvidence = (
+          languageObservation
+          && typeof languageObservation === 'object'
+          && !Array.isArray(languageObservation)
+        ) ? languageObservation : null;
+        const detectedLanguage = typeof languageObservation === 'string'
+          ? languageObservation
+          : null;
+        const observedLanguage = languageEvidence?.language || detectedLanguage;
         const decision = await routeInteraction({
           contactId: jid,
           contactAliases,
           eventId,
           kind: 'content',
           detectedLanguage,
-          provisionalLanguage: detectedLanguage
+          languageEvidence,
+          provisionalLanguage: observedLanguage
             ? null
             : provisionalLanguageFromWhatsAppIdentity(jid, contactAliases),
         });

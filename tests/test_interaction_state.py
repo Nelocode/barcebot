@@ -7,6 +7,16 @@ from interaction_state import PersistentInteractionState
 
 
 class PersistentInteractionStateTests(unittest.TestCase):
+    @staticmethod
+    def evidence(language, *, strong=False, score=4, margin=4):
+        return {
+            "language": language,
+            "strong": strong,
+            "explicit": False,
+            "score": score,
+            "margin": margin,
+        }
+
     def test_preview_does_not_consume_interaction_before_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
@@ -134,7 +144,7 @@ class PersistentInteractionStateTests(unittest.TestCase):
                 contact_id=1,
                 event_id="message:2",
                 kind="content",
-                detected_language="en",
+                language_evidence=self.evidence("en", strong=True, score=7, margin=7),
             )
             self.assertEqual("en", text.language)
             saved = json.loads(state_path.read_text(encoding="utf-8"))
@@ -184,6 +194,142 @@ class PersistentInteractionStateTests(unittest.TestCase):
             decision = store.register(contact_id=1, event_id="message:1", kind="content")
 
             self.assertEqual("step1", decision.response_key)
+
+    def test_weak_candidate_needs_two_events_and_survives_reload_and_non_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            store = PersistentInteractionState(state_path)
+            store.register(
+                contact_id=1,
+                event_id="message:es",
+                kind="content",
+                language_evidence=self.evidence("es", strong=True, score=7, margin=7),
+            )
+            before_preview = state_path.read_bytes()
+            preview = store.preview(
+                contact_id=1,
+                event_id="message:en-1",
+                kind="content",
+                language_evidence=self.evidence("en"),
+            )
+            self.assertEqual("es", preview.language)
+            self.assertEqual(before_preview, state_path.read_bytes())
+
+            first = store.register(
+                contact_id=1,
+                event_id="message:en-1",
+                kind="content",
+                language_evidence=self.evidence("en"),
+            )
+            self.assertEqual("es", first.language)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            contact = next(iter(saved["contacts"].values()))
+            self.assertEqual("en", contact["language_candidate"])
+            self.assertEqual(1, contact["language_candidate_streak"])
+
+            duplicate_bytes = state_path.read_bytes()
+            duplicate = store.register(
+                contact_id=1,
+                event_id="message:en-1",
+                kind="content",
+                language_evidence=self.evidence("fr", strong=True, score=7, margin=7),
+            )
+            self.assertTrue(duplicate.duplicate)
+            self.assertEqual(duplicate_bytes, state_path.read_bytes())
+
+            reloaded = PersistentInteractionState(state_path)
+            reloaded.register(contact_id=1, event_id="call:1", kind="call")
+            after_call = json.loads(state_path.read_text(encoding="utf-8"))
+            contact = next(iter(after_call["contacts"].values()))
+            self.assertEqual("en", contact["language_candidate"])
+            second = reloaded.register(
+                contact_id=1,
+                event_id="message:en-2",
+                kind="content",
+                language_evidence=self.evidence("en"),
+            )
+            self.assertEqual("en", second.language)
+            final_contact = next(iter(json.loads(state_path.read_text(encoding="utf-8"))["contacts"].values()))
+            self.assertEqual("detected", final_contact["language_source"])
+            self.assertIsNone(final_contact["language_candidate"])
+
+    def test_different_weak_language_does_not_immediately_replace_provisional(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            store.register(
+                contact_id=1,
+                event_id="image:1",
+                kind="content",
+                provisional_language="fr",
+            )
+            first = store.register(
+                contact_id=1,
+                event_id="message:es-1",
+                kind="content",
+                language_evidence=self.evidence("es"),
+            )
+            second = store.register(
+                contact_id=1,
+                event_id="message:es-2",
+                kind="content",
+                language_evidence=self.evidence("es"),
+            )
+            self.assertEqual("fr", first.language)
+            self.assertEqual("es", second.language)
+
+    def test_strong_evidence_overrides_operator_seed_and_clears_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            contact_key = PersistentInteractionState._fingerprint("contact", 1)
+            state_path.write_text(json.dumps({
+                "version": 1,
+                "contacts": {
+                    contact_key: {
+                        "phase": 0,
+                        "language": "fr",
+                        "language_source": "operator_seed",
+                        "language_provisional": False,
+                        "language_candidate": "en",
+                        "language_candidate_streak": 1,
+                        "recent_events": [],
+                        "updated_at": 0,
+                    }
+                },
+            }), encoding="utf-8")
+            decision = PersistentInteractionState(state_path).register(
+                contact_id=1,
+                event_id="message:es",
+                kind="content",
+                language_evidence=self.evidence("es", strong=True, score=11, margin=11),
+            )
+            self.assertEqual("es", decision.language)
+            contact = next(iter(json.loads(state_path.read_text(encoding="utf-8"))["contacts"].values()))
+            self.assertEqual("detected", contact["language_source"])
+            self.assertIsNone(contact["language_candidate"])
+
+    def test_malformed_evidence_fails_closed_and_is_not_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            store = PersistentInteractionState(state_path)
+            store.register(
+                contact_id=1,
+                event_id="message:es",
+                kind="content",
+                language_evidence=self.evidence("es", strong=True, score=7, margin=7),
+            )
+            malformed = self.evidence("fr", strong=True, score=7, margin=7)
+            malformed["raw_text"] = "sensitive-customer-content"
+            decision = store.register(
+                contact_id=1,
+                event_id="message:invalid",
+                kind="content",
+                language_evidence=malformed,
+            )
+
+            serialized = state_path.read_text(encoding="utf-8")
+            self.assertEqual("es", decision.language)
+            self.assertNotIn("raw_text", serialized)
+            self.assertNotIn("sensitive-customer-content", serialized)
 
 
 if __name__ == "__main__":

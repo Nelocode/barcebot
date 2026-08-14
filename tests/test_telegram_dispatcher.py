@@ -7,6 +7,7 @@ import unittest
 from telethon.tl import functions, types
 
 from interaction_state import PersistentInteractionState
+from language_detection import detect_language_evidence
 from telegram_dispatcher import (
     TelegramInteractionDispatcher,
     build_telegram_media_request,
@@ -32,7 +33,13 @@ class TelegramInteractionDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 chat_id=1,
                 event_id="message:2",
                 kind="content",
-                detected_language="en",
+                language_evidence={
+                    "language": "en",
+                    "strong": True,
+                    "explicit": False,
+                    "score": 7,
+                    "margin": 7,
+                },
             )
 
             self.assertEqual([("call", "es"), ("step2", "en")], deliveries)
@@ -40,6 +47,39 @@ class TelegramInteractionDispatcherTests(unittest.IsolatedAsyncioTestCase):
             contact = next(iter(persisted["contacts"].values()))
             self.assertEqual("en", contact["language"])
             self.assertFalse(contact["language_provisional"])
+
+    async def test_strong_natural_french_overrides_telegram_spanish_provisional(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state = PersistentInteractionState(state_path)
+            deliveries = []
+
+            async def send_response(_peer, key, language, _fingerprint):
+                deliveries.append((key, language))
+
+            dispatcher = TelegramInteractionDispatcher(state, send_response)
+            await dispatcher.dispatch(
+                chat_id=1,
+                event_id="message:image-fr",
+                kind="content",
+            )
+            evidence = detect_language_evidence(
+                "Salut, je cherche une fille disponible"
+            )
+            decision = await dispatcher.dispatch(
+                chat_id=1,
+                event_id="message:text-fr",
+                kind="content",
+                language_evidence=evidence,
+            )
+
+            self.assertTrue(evidence["strong"])
+            self.assertEqual("fr", decision.language)
+            self.assertEqual([("step1", "es"), ("step2", "fr")], deliveries)
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            contact = next(iter(persisted["contacts"].values()))
+            self.assertEqual("detected", contact["language_source"])
+            self.assertIsNone(contact["language_candidate"])
 
     async def test_call_delivers_audio_before_text(self):
         order = []

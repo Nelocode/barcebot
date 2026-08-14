@@ -7,7 +7,7 @@ import path from 'path';
 import { PersistentInteractionState } from '../interaction_state.mjs';
 import { createWhatsAppMessageHandler, describeInteraction } from '../wa_message_handler.mjs';
 import { KeyedSerialQueue } from '../keyed_serial_queue.mjs';
-import { detectLanguage } from '../language_detection.mjs';
+import { detectLanguageEvidence as detectLanguage } from '../language_detection.mjs';
 
 function incoming(id, message, overrides = {}) {
   return {
@@ -19,6 +19,10 @@ function incoming(id, message, overrides = {}) {
     },
     message,
   };
+}
+
+function strongEvidence(language) {
+  return { language, strong: true, explicit: false, score: 7, margin: 7 };
 }
 
 function createHarness() {
@@ -33,7 +37,7 @@ function createHarness() {
     routeInteraction: details => state.register(details),
     getResponseMessage: (_lang, key) => ({ text: key, audio: `${key}.mp3` }),
     readAudio: async filename => Buffer.from(filename),
-    detectLanguage: text => text === 'bonjour' ? 'fr' : 'es',
+    detectLanguage: text => strongEvidence(text === 'bonjour' ? 'fr' : 'es'),
     logger: { info() {}, warn() {}, error() {} },
   });
   return { handler, effects, state };
@@ -102,7 +106,7 @@ test('imagen sin texto usa +57 provisional y un texto inglés posterior lo reemp
       return { text: key, audio: '' };
     },
     readAudio: async () => null,
-    detectLanguage: text => text === 'hello' ? 'en' : null,
+    detectLanguage: text => text === 'hello' ? strongEvidence('en') : null,
     logger: { info() {}, warn() {}, error() {} },
   });
 
@@ -110,6 +114,79 @@ test('imagen sin texto usa +57 provisional y un texto inglés posterior lo reemp
   await handler({ type: 'notify', messages: [incoming('text', { conversation: 'hello' })] });
 
   assert.deepEqual(deliveredLanguages, [['es', 'step1'], ['en', 'step2']]);
+});
+
+test('texto español natural fuerte corrige de inmediato el provisional +33', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-message-natural-language-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const deliveredLanguages = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => {},
+    routeInteraction: details => state.register(details),
+    getResponseMessage: (language, key) => {
+      deliveredLanguages.push([language, key]);
+      return { text: key, audio: '' };
+    },
+    readAudio: async () => null,
+    detectLanguage,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const frenchIdentity = { remoteJid: '33612345678@s.whatsapp.net' };
+
+  await handler({
+    type: 'notify',
+    messages: [incoming('image-fr', { imageMessage: {} }, frenchIdentity)],
+  });
+  await handler({
+    type: 'notify',
+    messages: [incoming(
+      'text-es',
+      { conversation: 'Estoy buscando una chica disponible' },
+      frenchIdentity,
+    )],
+  });
+
+  assert.deepEqual(deliveredLanguages, [['fr', 'step1'], ['es', 'step2']]);
+  const persisted = Object.values(state.contacts)[0];
+  assert.equal(persisted.language, 'es');
+  assert.equal(persisted.language_provisional, false);
+});
+
+test('Mándame información corrige de inmediato el provisional francés de WhatsApp', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-message-mandame-language-'));
+  const state = new PersistentInteractionState({ filePath: path.join(directory, 'state.json') });
+  const deliveredLanguages = [];
+  const handler = createWhatsAppMessageHandler({
+    sendMessage: async () => {},
+    routeInteraction: details => state.register(details),
+    getResponseMessage: (language, key) => {
+      deliveredLanguages.push([language, key]);
+      return { text: key, audio: '' };
+    },
+    readAudio: async () => null,
+    detectLanguage,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const frenchIdentity = { remoteJid: '33612345678@s.whatsapp.net' };
+
+  await handler({
+    type: 'notify',
+    messages: [incoming('image-fr-mandame', { imageMessage: {} }, frenchIdentity)],
+  });
+  await handler({
+    type: 'notify',
+    messages: [incoming(
+      'text-es-mandame',
+      { conversation: 'Mándame información' },
+      frenchIdentity,
+    )],
+  });
+
+  assert.deepEqual(deliveredLanguages, [['fr', 'step1'], ['es', 'step2']]);
+  const persisted = Object.values(state.contacts)[0];
+  assert.equal(persisted.language, 'es');
+  assert.equal(persisted.language_source, 'detected');
+  assert.equal(persisted.language_candidate, null);
 });
 
 test('caption con empate no confirma idioma y texto claro posterior lo reemplaza', async () => {

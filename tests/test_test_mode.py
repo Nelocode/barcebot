@@ -63,6 +63,9 @@ class TestModeStateTests(unittest.TestCase):
             self.assertTrue(result["reset"])
             self.assertEqual(0, current["contacts"][canonical]["phase"])
             self.assertEqual("en", current["contacts"][canonical]["language"])
+            self.assertEqual("operator_seed", current["contacts"][canonical]["language_source"])
+            self.assertIsNone(current["contacts"][canonical]["language_candidate"])
+            self.assertEqual(0, current["contacts"][canonical]["language_candidate_streak"])
             self.assertEqual([], current["contacts"][canonical]["recent_events"])
             self.assertIs(current["contacts"][canonical]["reset_pending"], True)
             self.assertNotIn("573001234567", serialized)
@@ -85,8 +88,12 @@ class TestModeStateTests(unittest.TestCase):
             self.assertEqual(2, current["version"])
             self.assertEqual(1, len(current["contacts"]))
             self.assertEqual(2, len(current["aliases"]))
-            self.assertIsNone(next(iter(current["contacts"].values()))["language"])
-            self.assertIs(next(iter(current["contacts"].values()))["reset_pending"], True)
+            contact = next(iter(current["contacts"].values()))
+            self.assertIsNone(contact["language"])
+            self.assertIsNone(contact["language_source"])
+            self.assertIsNone(contact["language_candidate"])
+            self.assertEqual(0, contact["language_candidate_streak"])
+            self.assertIs(contact["reset_pending"], True)
             self.assertNotIn("573009876543", serialized)
             self.assertIsNone(result["backup"])
 
@@ -139,6 +146,8 @@ class TestModeStateTests(unittest.TestCase):
             self.assertEqual(2, result["remaining"])
             self.assertEqual(0, current["contacts"]["latest"]["phase"])
             self.assertEqual("fr", current["contacts"]["latest"]["language"])
+            self.assertEqual("operator_seed", current["contacts"]["latest"]["language_source"])
+            self.assertIsNone(current["contacts"]["latest"]["language_candidate"])
             self.assertEqual([], current["contacts"]["latest"]["recent_events"])
             self.assertEqual(original["aliases"], current["aliases"])
             self.assertEqual(original, backup)
@@ -175,7 +184,13 @@ class TestModeStateTests(unittest.TestCase):
                 contact_id=451,
                 event_id="after-reset",
                 kind="content",
-                detected_language="fr",
+                language_evidence={
+                    "language": "fr",
+                    "strong": False,
+                    "explicit": False,
+                    "score": 4,
+                    "margin": 4,
+                },
             )
 
             self.assertEqual("step1", decision.response_key)
@@ -301,8 +316,10 @@ class TestModeRoutesTests(unittest.TestCase):
         whatsapp_state = json.loads(app_module.WA_INTERACTION_STATE_FILE.read_text(encoding="utf-8"))
         self.assertEqual(0, telegram_state["contacts"]["tester-hash"]["phase"])
         self.assertEqual("en", telegram_state["contacts"]["tester-hash"]["language"])
+        self.assertEqual("operator_seed", telegram_state["contacts"]["tester-hash"]["language_source"])
         self.assertEqual(0, whatsapp_state["contacts"]["tester-hash"]["phase"])
         self.assertEqual("en", whatsapp_state["contacts"]["tester-hash"]["language"])
+        self.assertEqual("operator_seed", whatsapp_state["contacts"]["tester-hash"]["language_source"])
         stop_telegram.assert_called_once()
         restart_telegram.assert_called_once()
         stop_whatsapp.assert_called_once_with(self.data_dir / "wa_bot.pid")
@@ -347,6 +364,8 @@ class TestModeRoutesTests(unittest.TestCase):
         contact = next(iter(json.loads(serialized)["contacts"].values()))
         self.assertEqual(0, contact["phase"])
         self.assertEqual("en", contact["language"])
+        self.assertEqual("operator_seed", contact["language_source"])
+        self.assertIsNone(contact["language_candidate"])
 
         with (
             patch.object(app_module, "_test_mode_switch_conflict", return_value=None),
