@@ -102,6 +102,26 @@ test('una pausa rechaza la llamada sin consumir el estado de interacción', asyn
   assert.equal(metrics.at(-1).reason, 'delivery_blocked');
 });
 
+test('una suspensión comercial no rechaza ni registra la llamada', async () => {
+  let routed = 0;
+  const { handler, effects, metrics } = createHarness({
+    interactionAllowed: () => false,
+    routeInteraction: () => {
+      routed += 1;
+      return { duplicate: false, language: 'es', contactKey: 'contact' };
+    },
+    getResponseMessage: () => ({ text: '', audio: '' }),
+  });
+
+  const result = await handler([offer({ id: 'billing-blocked-call' })]);
+
+  assert.equal(result[0].status, 'ignored');
+  assert.equal(result[0].reason, 'interaction_blocked');
+  assert.equal(routed, 0);
+  assert.deepEqual(effects, []);
+  assert.equal(metrics.at(-1).reason, 'interaction_blocked');
+});
+
 test('envia OGG/Opus como nota de voz cuando el lector lo proporciona', async () => {
   const { handler, effects } = createHarness({
     readAudio: async () => ({

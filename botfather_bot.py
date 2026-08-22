@@ -13,6 +13,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from language_adaptation import reduce_language_state
 from language_detection import detect_language, detect_language_evidence
+from billing_entitlement import billing_gate
 
 # ── Config ────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -144,12 +145,18 @@ def load_messages_fresh():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Silent start — no welcome, user's first message triggers lang detection."""
+    if not await billing_gate.is_service_allowed_async():
+        logging.info("BotFather start ignored by service entitlement gate")
+        return
     chat_id = update.effective_chat.id
     if chat_id in user_state:
         del user_state[chat_id]
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await billing_gate.is_service_allowed_async():
+        logging.info("BotFather message ignored by service entitlement gate")
+        return
     chat_id = update.effective_chat.id
     text = (update.message.text or update.message.caption or "").strip()
     evidence = detect_lang_evidence(text) if text else None
@@ -203,6 +210,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Voice/video note treated as call."""
+    if not await billing_gate.is_service_allowed_async():
+        logging.info("BotFather media ignored by service entitlement gate")
+        return
     chat_id = update.effective_chat.id
     logging.info("[BF] Media interaction received")
 

@@ -110,3 +110,24 @@ Los valores predeterminados son conservadores y pueden ajustarse mediante:
 - **Bot WhatsApp:** Node.js (Baileys v7).
 - **Bot Telegram:** Python (Telethon / python-telegram-bot).
 - **Orquestación:** `entrypoint.sh` inicia todos los procesos de forma paralela y resiliente.
+
+### Recuperación privada automática de WhatsApp
+
+La alerta de relink es opt-in. Configura sólo en el entorno privado del panel:
+
+- `WA_RELINK_ENABLED=1`
+- `WA_RELINK_PUBLIC_BASE_URL=https://tu-dominio` (HTTPS, sin query ni fragmento)
+- `WA_RELINK_TELEGRAM_CHAT_ID=<destino privado explícito>`
+- `WA_RELINK_TELEGRAM_BOT_TOKEN=<token del bot privado>`
+- `WA_RELINK_SERVICE_NAME=<nombre corto del servicio>`
+
+Si falta `WA_RELINK_TELEGRAM_BOT_TOKEN`, se usa `AUTOREPLY_BOT_TOKEN`; se
+recomienda un bot privado dedicado. `WA_RELINK_LINK_TTL_SECONDS` es opcional,
+vale 900 segundos y se limita al rango 300–3600.
+
+Sólo `logged_out` o `session_invalid` abren un incidente persistente. Telegram
+recibe el mismo enlace privado en reintentos acotados, nunca el PNG. El enlace
+usa `#TOKEN`, lo elimina del historial antes de enviarlo al servidor y su visita
+no genera QR. Tras confirmar, el QR dura 180 segundos. El cliente aún debe
+escanearlo en **WhatsApp → Dispositivos vinculados**. La autenticación anterior
+se conserva hasta verificar la nueva conexión principal como abierta.

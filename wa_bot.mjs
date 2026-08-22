@@ -15,19 +15,30 @@ import { PersistentInteractionState } from './interaction_state.mjs';
 import { createWhatsAppMessageHandler } from './wa_message_handler.mjs';
 import { KeyedSerialQueue } from './keyed_serial_queue.mjs';
 import { detectLanguageEvidence } from './language_detection.mjs';
-import { classifyWhatsAppDisconnect } from './wa_disconnect_policy.mjs';
+import {
+  classifyWhatsAppDisconnect,
+  diagnoseWhatsAppDisconnect,
+} from './wa_disconnect_policy.mjs';
 import { createWhatsAppVoiceNoteReader } from './wa_audio_delivery.mjs';
 import { applyWhatsAppProfilePicture } from './wa_profile_picture.mjs';
 import { createWhatsAppSafetyHealth } from './wa_safety_health.mjs';
+import { createWhatsAppIncidentMonitor } from './wa_incident_monitor.mjs';
 import {
   createWhatsAppDeliverySafety,
   readWhatsAppSafetyConfig,
   recordWhatsAppProviderSignal,
 } from './wa_delivery_safety.mjs';
+import { createEntitlementGate } from './billing_entitlement.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE_DIR = path.resolve(process.env.BOT_DIR || __dirname);
 const DATA_DIR = path.join(BASE_DIR, 'data');
+const entitlementGate = createEntitlementGate({ dataDir: DATA_DIR, logger: console });
+void entitlementGate.refresh({ force: true });
+const entitlementRefreshTimer = setInterval(() => {
+  void entitlementGate.refresh({ force: true });
+}, 60_000);
+if (typeof entitlementRefreshTimer.unref === 'function') entitlementRefreshTimer.unref();
 const AUDIO_DIR = path.join(BASE_DIR, 'data', 'audios');
 const MESSAGES_FILE = path.join(BASE_DIR, 'data', 'messages.json');
 const AUTH_DIR = path.resolve(process.env.WA_AUTH_DIR || path.join(DATA_DIR, 'wa_auth'));
@@ -40,6 +51,12 @@ const SAFETY_HEALTH_FILE = path.resolve(
 );
 const SAFETY_CONTROL_FILE = path.resolve(
   process.env.WA_SAFETY_CONTROL_FILE || path.join(DATA_DIR, 'wa_safety_control.json'),
+);
+const INCIDENT_HEALTH_FILE = path.resolve(
+  process.env.WA_INCIDENT_HEALTH_FILE || path.join(DATA_DIR, 'wa_incident_health.json'),
+);
+const INCIDENT_LEDGER_FILE = path.resolve(
+  process.env.WA_INCIDENT_LEDGER_FILE || path.join(DATA_DIR, 'wa_incidents.jsonl'),
 );
 const INTERACTION_STATE_FILE = path.resolve(
   process.env.WA_INTERACTION_STATE_FILE || path.join(DATA_DIR, 'wa_interaction_state.json'),
@@ -70,6 +87,12 @@ const safetyHealth = LINK_ONLY ? null : createWhatsAppSafetyHealth({
   controlFilePath: SAFETY_CONTROL_FILE,
   logger: console,
 });
+const incidentMonitor = LINK_ONLY ? null : createWhatsAppIncidentMonitor({
+  stateFile: INCIDENT_HEALTH_FILE,
+  ledgerFile: INCIDENT_LEDGER_FILE,
+  workerRevision: callHealth.snapshot().worker_revision,
+  logger: console,
+});
 const interactionState = LINK_ONLY ? null : new PersistentInteractionState({
   filePath: INTERACTION_STATE_FILE,
   defaultLanguage: DEFAULT_LANGUAGE,
@@ -80,6 +103,7 @@ const interactionState = LINK_ONLY ? null : new PersistentInteractionState({
 const interactionClaimQueue = new KeyedSerialQueue();
 const deliveryQueue = new KeyedSerialQueue();
 const CONNECTION_TIMEOUT_MS = 30_000;
+const SLOW_CONNECT_MS = 20_000;
 const SAFETY_HEARTBEAT_MS = 30_000;
 const SAFETY_HANDLER_SEND_TIMEOUT_MS = Math.max(
   30_000,
@@ -102,9 +126,18 @@ let shuttingDown = false;
 let linkExpiryTimer = null;
 let activeDeliverySafety = null;
 let safetyHeartbeatTimer = null;
+let slowConnectTimer = null;
 
 if (safetyHealth) {
-  safetyHeartbeatTimer = setInterval(() => safetyHealth.touch(), SAFETY_HEARTBEAT_MS);
+  const touchHealth = () => {
+    safetyHealth.touch();
+    incidentMonitor?.heartbeat({
+      safety: safetyHealth.snapshot(),
+      connection: callHealth.snapshot().connection,
+    });
+  };
+  touchHealth();
+  safetyHeartbeatTimer = setInterval(touchHealth, SAFETY_HEARTBEAT_MS);
   if (typeof safetyHeartbeatTimer.unref === 'function') safetyHeartbeatTimer.unref();
 }
 
@@ -143,6 +176,7 @@ function recordProviderRestriction(statusCode) {
     health: safetyHealth,
     config: safetyConfig,
     attempt: Math.max(1, reconnectAttempts + 1),
+    onDiagnostic: signal => incidentMonitor?.recordOperationalSignal(signal),
   });
 }
 
@@ -165,11 +199,17 @@ function scheduleReconnect(statusCode = null) {
     activeBackoffDelay,
     Math.round(exponentialDelay * (0.9 + Math.random() * 0.2)),
   );
+  incidentMonitor?.recordReconnectScheduled({
+    attempt: reconnectAttempts,
+    delayMs: reconnectDelay,
+    statusCode: normalizedStatus,
+  });
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     if (shuttingDown) return;
     startBot().catch(() => {
       console.error('[WA] Reconnection setup failed');
+      incidentMonitor?.recordOperationalSignal({ type: 'startup_failure' });
       scheduleReconnect();
     });
   }, reconnectDelay);
@@ -188,8 +228,11 @@ function terminateInvalidSession() {
   linkExpiryTimer = null;
   if (safetyHeartbeatTimer) clearInterval(safetyHeartbeatTimer);
   safetyHeartbeatTimer = null;
+  if (slowConnectTimer) clearTimeout(slowConnectTimer);
+  slowConnectTimer = null;
   activeDeliverySafety?.cancelAll('invalid_session');
   activeDeliverySafety = null;
+  incidentMonitor?.recordWorkerShutdown('invalid-session');
   fs.unwatchFile(MESSAGES_FILE);
   setImmediate(() => process.exit(0));
 }
@@ -211,17 +254,19 @@ function loadMessages() {
   return result;
 }
 
-let MESSAGES = loadMessages();
+let MESSAGES = LINK_ONLY ? {} : loadMessages();
 
 // ── Watch messages.json para recargar en caliente (cuando admin panel guarda) ──
-fs.watchFile(MESSAGES_FILE, () => {
-  try {
-    MESSAGES = loadMessages();
-    console.log(`[WA] messages.json recargado — ${Object.keys(MESSAGES).length} idiomas`);
-  } catch (e) {
-    console.error('[WA] Error recargando messages.json:', e.message);
-  }
-});
+if (!LINK_ONLY) {
+  fs.watchFile(MESSAGES_FILE, () => {
+    try {
+      MESSAGES = loadMessages();
+      console.log(`[WA] messages.json recargado — ${Object.keys(MESSAGES).length} idiomas`);
+    } catch (e) {
+      console.error('[WA] Error recargando messages.json:', e.message);
+    }
+  });
+}
 
 function detectLang(text) {
   return detectLanguageEvidence(text);
@@ -264,6 +309,7 @@ async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
   callHealth.record({ type: 'connection', state: 'connecting' });
+  incidentMonitor?.recordConnecting({ registered: state.creds?.registered === true });
 
   const sock = makeWASocket({
     auth: state,
@@ -282,8 +328,18 @@ async function startBot() {
     health: safetyHealth,
     config: safetyConfig,
     logger: console,
+    onDiagnostic: signal => incidentMonitor?.recordOperationalSignal(signal),
   });
   activeDeliverySafety = deliverySafety;
+  if (slowConnectTimer) clearTimeout(slowConnectTimer);
+  slowConnectTimer = state.creds?.registered
+    ? setTimeout(() => {
+        if (activeSocket === sock && !shuttingDown) {
+          incidentMonitor?.recordOperationalSignal({ type: 'slow_connect' });
+        }
+      }, SLOW_CONNECT_MS)
+    : null;
+  if (typeof slowConnectTimer?.unref === 'function') slowConnectTimer.unref();
   const connectionWatchdog = state.creds?.registered
     ? setTimeout(() => {
         if (activeSocket !== sock || shuttingDown) return;
@@ -292,6 +348,7 @@ async function startBot() {
         deliverySafety?.cancelAll('connection_timeout');
         if (activeDeliverySafety === deliverySafety) activeDeliverySafety = null;
         callHealth.record({ type: 'connection', state: 'closed', reason: 'timeout' });
+        incidentMonitor?.recordOperationalSignal({ type: 'connection_timeout' });
         try {
           sock.end(new Error('connection-timeout'));
         } catch {
@@ -314,6 +371,7 @@ async function startBot() {
     const handleCallBatch = createWhatsAppCallHandler({
       rejectCall: (callId, callFrom) => sock.rejectCall(callId, callFrom),
       sendMessage: (jid, content) => deliverySafety.send(jid, content),
+      interactionAllowed: () => entitlementGate.isAllowedCached(),
       deliveryAllowed: () => deliverySafety.canDeliver(),
       getCallMessage,
       getResponseMessage,
@@ -336,7 +394,15 @@ async function startBot() {
   }
 
   // ── Guardar credenciales cuando se actualicen ──
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', () => {
+    try {
+      void Promise.resolve(saveCreds()).catch(() => {
+        incidentMonitor?.recordOperationalSignal({ type: 'auth_write_failure' });
+      });
+    } catch {
+      incidentMonitor?.recordOperationalSignal({ type: 'auth_write_failure' });
+    }
+  });
 
   // ── Manejar conexión / reconexión ──
   sock.ev.on('connection.update', (update) => {
@@ -358,11 +424,14 @@ async function startBot() {
     if (connection === 'close') {
       if (activeSocket !== sock) return;
       if (connectionWatchdog) clearTimeout(connectionWatchdog);
+      if (slowConnectTimer) clearTimeout(slowConnectTimer);
+      slowConnectTimer = null;
       if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
       reconnectStabilityTimer = null;
       activeSocket = null;
       deliverySafety?.cancelAll('connection_closed');
       if (activeDeliverySafety === deliverySafety) activeDeliverySafety = null;
+      if (shuttingDown) return;
       const disconnectStatus = lastDisconnect?.error instanceof Boom
         ? lastDisconnect.error.output?.statusCode
         : (
@@ -374,6 +443,8 @@ async function startBot() {
         );
       recordProviderRestriction(disconnectStatus);
       const disconnect = classifyWhatsAppDisconnect(disconnectStatus);
+      const diagnostic = diagnoseWhatsAppDisconnect(disconnectStatus);
+      incidentMonitor?.recordConnectionClosed(diagnostic);
       callHealth.record({
         type: 'connection',
         state: 'closed',
@@ -394,6 +465,8 @@ async function startBot() {
     if (connection === 'open') {
       if (activeSocket !== sock) return;
       if (connectionWatchdog) clearTimeout(connectionWatchdog);
+      if (slowConnectTimer) clearTimeout(slowConnectTimer);
+      slowConnectTimer = null;
       if (reconnectStabilityTimer) clearTimeout(reconnectStabilityTimer);
       reconnectStabilityTimer = setTimeout(() => {
         if (activeSocket === sock && !shuttingDown) reconnectAttempts = 0;
@@ -401,6 +474,7 @@ async function startBot() {
       }, safetyConfig.reconnectStableMs);
       if (typeof reconnectStabilityTimer.unref === 'function') reconnectStabilityTimer.unref();
       callHealth.record({ type: 'connection', state: 'open' });
+      incidentMonitor?.recordConnectionOpen();
       try {
         fs.rmSync(QR_PATH, { force: true });
         writeIdentity(sock.user);
@@ -430,7 +504,9 @@ async function startBot() {
     const handleMessageBatch = createWhatsAppMessageHandler({
       sendMessage: (jid, content) => deliverySafety.send(jid, content),
       markRead: messageKey => deliverySafety.markRead(messageKey),
-      deliveryAllowed: () => deliverySafety.canDeliver(),
+      deliveryAllowed: () => (
+        deliverySafety.canDeliver() && entitlementGate.isAllowedCached()
+      ),
       routeInteraction: details => interactionState.register(details),
       getResponseMessage,
       readAudio,
@@ -468,6 +544,8 @@ function shutdown(signal) {
   linkExpiryTimer = null;
   if (safetyHeartbeatTimer) clearInterval(safetyHeartbeatTimer);
   safetyHeartbeatTimer = null;
+  if (slowConnectTimer) clearTimeout(slowConnectTimer);
+  slowConnectTimer = null;
   activeDeliverySafety?.cancelAll('worker_shutdown');
   activeDeliverySafety = null;
   callHealth.record({ type: 'connection', state: 'closed', reason: 'shutdown' });
@@ -477,6 +555,7 @@ function shutdown(signal) {
   } catch {
     // Process shutdown must continue even if the socket is already closed.
   }
+  incidentMonitor?.recordWorkerShutdown(signal);
   process.exit(0);
 }
 
@@ -493,5 +572,6 @@ process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 startBot().catch(() => {
   console.error('[WA] Initial connection setup failed');
+  incidentMonitor?.recordOperationalSignal({ type: 'startup_failure' });
   scheduleReconnect();
 });

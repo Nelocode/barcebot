@@ -48,6 +48,7 @@ from telegram_dispatcher import (
     build_telegram_text_request,
     deliver_telegram_response_components,
 )
+from billing_entitlement import billing_gate
 
 
 BASE_DIR = Path(__file__).parent
@@ -441,6 +442,9 @@ async def process_interaction(
     language_evidence: dict[str, object] | None = None,
     reply_peer: object | None = None,
 ) -> None:
+    if not await billing_gate.is_service_allowed_async():
+        logging.info("Telegram interaction ignored by service entitlement gate")
+        return
     decision = await telegram_dispatcher.dispatch(
         chat_id=chat_id,
         event_id=event_id,
