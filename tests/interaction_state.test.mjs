@@ -257,7 +257,7 @@ test('candidato dÃ©bil requiere dos eventos y sobrevive recarga y evento no te
   assert.equal(second.languageCandidate, null);
 });
 
-test('un dÃ©bil distinto no reemplaza provisional hasta el segundo evento', () => {
+test('un idioma débil distinto reemplaza el provisional en el primer evento', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'interaction-state-'));
   const store = createStore(directory);
   store.register({
@@ -272,13 +272,19 @@ test('un dÃ©bil distinto no reemplaza provisional hasta el segundo evento', ()
     kind: 'content',
     languageEvidence: evidence('es'),
   });
-  const second = store.register({
+  const persisted = Object.values(JSON.parse(fs.readFileSync(path.join(directory, 'state.json'), 'utf8')).contacts)[0];
+  assert.equal(persisted.language_provisional, true);
+  assert.equal(persisted.language_source, 'provisional');
+  assert.equal(persisted.language_candidate, 'es');
+  assert.equal(persisted.language_candidate_streak, 1);
+  const reloaded = createStore(directory);
+  const second = reloaded.register({
     contactId: 'a',
     eventId: 'message:es-2',
     kind: 'content',
     languageEvidence: evidence('es'),
   });
-  assert.equal(first.language, 'fr');
+  assert.equal(first.language, 'es');
   assert.equal(second.language, 'es');
 });
 

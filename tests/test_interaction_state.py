@@ -253,7 +253,7 @@ class PersistentInteractionStateTests(unittest.TestCase):
             self.assertEqual("detected", final_contact["language_source"])
             self.assertIsNone(final_contact["language_candidate"])
 
-    def test_different_weak_language_does_not_immediately_replace_provisional(self):
+    def test_different_weak_language_immediately_replaces_provisional(self):
         with tempfile.TemporaryDirectory() as directory:
             store = self.make_store(directory)
             store.register(
@@ -268,13 +268,20 @@ class PersistentInteractionStateTests(unittest.TestCase):
                 kind="content",
                 language_evidence=self.evidence("es"),
             )
-            second = store.register(
+            saved = json.loads((Path(directory) / "state.json").read_text(encoding="utf-8"))
+            provisional = next(iter(saved["contacts"].values()))
+            self.assertTrue(provisional["language_provisional"])
+            self.assertEqual("provisional", provisional["language_source"])
+            self.assertEqual("es", provisional["language_candidate"])
+            self.assertEqual(1, provisional["language_candidate_streak"])
+            reloaded = self.make_store(directory)
+            second = reloaded.register(
                 contact_id=1,
                 event_id="message:es-2",
                 kind="content",
                 language_evidence=self.evidence("es"),
             )
-            self.assertEqual("fr", first.language)
+            self.assertEqual("es", first.language)
             self.assertEqual("es", second.language)
 
     def test_strong_evidence_overrides_operator_seed_and_clears_candidate(self):

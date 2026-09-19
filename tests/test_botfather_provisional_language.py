@@ -87,7 +87,7 @@ class BotFatherProvisionalLanguageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(botfather_bot.detect_lang("photo"))
         self.assertIsNone(botfather_bot.detect_lang("video"))
 
-    def test_weak_language_needs_two_consecutive_messages_after_provisional(self):
+    def test_weak_language_replaces_provisional_on_first_message(self):
         state, _ = botfather_bot.update_user_language(None, None, now=100)
         first, _ = botfather_bot.update_user_language(
             state,
@@ -101,7 +101,7 @@ class BotFatherProvisionalLanguageTests(unittest.IsolatedAsyncioTestCase):
                 "margin": 4,
             },
         )
-        self.assertEqual("es", first["lang"])
+        self.assertEqual("en", first["lang"])
         self.assertEqual("en", first["language_candidate"])
         second, _ = botfather_bot.update_user_language(
             first,
@@ -118,6 +118,67 @@ class BotFatherProvisionalLanguageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("en", second["lang"])
         self.assertFalse(second["language_provisional"])
+
+    async def test_real_short_english_replaces_no_text_spanish_on_first_reply(self):
+        for chat_id, text in enumerate(("Hi", "How much?"), start=101):
+            with self.subTest(text=text):
+                image = self.update(chat_id=chat_id)
+                english = self.update(chat_id=chat_id, text=text)
+                evidence = botfather_bot.detect_lang_evidence(text)
+                self.assertEqual("en", evidence["language"])
+                self.assertFalse(evidence["strong"])
+                with patch.object(botfather_bot, "MESSAGES", self.messages), patch.object(
+                    botfather_bot, "load_messages_fresh"
+                ):
+                    await botfather_bot.handle_message(image, None)
+                    self.assertTrue(botfather_bot.user_state[chat_id]["language_provisional"])
+                    await botfather_bot.handle_message(english, None)
+
+                image.message.reply_text.assert_awaited_once_with("es-step1")
+                english.message.reply_text.assert_awaited_once_with("en-step2")
+                self.assertEqual("en", botfather_bot.user_state[chat_id]["lang"])
+
+    async def test_real_weak_english_still_needs_two_observations_after_confirmed_spanish(self):
+        spanish = self.update(text="Hola, necesito ayuda", chat_id=103)
+        first = self.update(text="Hi", chat_id=103)
+        second = self.update(text="How much?", chat_id=103)
+        with patch.object(botfather_bot, "MESSAGES", self.messages), patch.object(
+            botfather_bot, "load_messages_fresh"
+        ):
+            await botfather_bot.handle_message(spanish, None)
+            self.assertFalse(botfather_bot.user_state[103]["language_provisional"])
+            await botfather_bot.handle_message(first, None)
+            first.message.reply_text.assert_awaited_once_with("es-step2")
+            await botfather_bot.handle_message(second, None)
+
+        second.message.reply_text.assert_awaited_once_with("en-step2")
+        self.assertFalse(botfather_bot.user_state[103]["language_provisional"])
+
+    async def test_ambiguous_and_negated_english_leave_provisional_spanish_unchanged(self):
+        for chat_id, text in enumerate(("ok 👍", "I don't speak English"), start=104):
+            with self.subTest(text=text):
+                image = self.update(chat_id=chat_id)
+                followup = self.update(chat_id=chat_id, text=text)
+                with patch.object(botfather_bot, "MESSAGES", self.messages), patch.object(
+                    botfather_bot, "load_messages_fresh"
+                ):
+                    await botfather_bot.handle_message(image, None)
+                    await botfather_bot.handle_message(followup, None)
+
+                followup.message.reply_text.assert_awaited_once_with("es-step2")
+                self.assertTrue(botfather_bot.user_state[chat_id]["language_provisional"])
+
+    async def test_explicit_english_request_changes_confirmed_spanish_immediately(self):
+        spanish = self.update(text="Hola, necesito ayuda", chat_id=106)
+        english = self.update(text="English please", chat_id=106)
+        with patch.object(botfather_bot, "MESSAGES", self.messages), patch.object(
+            botfather_bot, "load_messages_fresh"
+        ):
+            await botfather_bot.handle_message(spanish, None)
+            await botfather_bot.handle_message(english, None)
+
+        english.message.reply_text.assert_awaited_once_with("en-step2")
+        self.assertFalse(botfather_bot.user_state[106]["language_provisional"])
 
     def test_strong_evidence_overrides_operator_seed_and_clears_candidate(self):
         seeded = {

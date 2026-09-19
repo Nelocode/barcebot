@@ -73,9 +73,14 @@ clientes.
 El bot analiza localmente texto en español, inglés y francés con reglas Unicode
 compartidas por los procesos de JavaScript y Python. El idioma derivado del
 prefijo telefónico de WhatsApp, o el español inicial de Telegram, es sólo
-provisional: una evidencia fuerte o una petición expresa lo corrige de inmediato;
-una señal débil diferente debe repetirse en dos mensajes consecutivos. La
-detección es conservadora y no pretende ser perfecta. El estado conserva sólo
+provisional: el primer texto identificable lo corrige de inmediato, incluso si
+es breve, como `Hi` o `How much?`. Una señal débil mantiene el nuevo idioma como
+provisional hasta confirmarlo. Si el idioma anterior ya estaba confirmado, era
+heredado o lo había indicado el operador, cambiarlo sigue requiriendo evidencia
+fuerte, una petición expresa o dos mensajes débiles consecutivos. El vocabulario
+cubre también consultas como `Are you free tonight?` y `Looking for a girl tonight`.
+Los textos ambiguos no fuerzan un cambio. La detección es conservadora y no
+pretende ser perfecta. El estado conserva sólo
 el idioma, su origen y una racha acotada; no guarda texto ni tokens del cliente.
 
 ### Salud operativa de WhatsApp
